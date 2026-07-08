@@ -1,0 +1,7 @@
+.venv/
+fastmcp.txt
+llms-full.txt
+uv.lock
+__pycache__/
+*.pyc
+.env

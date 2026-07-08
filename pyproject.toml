@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+packages = ["src/x-mcp"]
+
+[project]
+name = "x-mcp-lite"
+version = "0.3.0"
+description = "Safety-focused lite fork of x-mcp: read-only + bookmarks + likes, with anti-rate-limit layer"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+    { name = "huake", email = "" }
+]
+dependencies = [
+    "fastmcp>=0.4.1",
+    "mcp>=1.2.0",
+    "twikit>=2.2.1",
+    "requests>=2.31.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/huake/x-mcp-lite"
+
+[project.scripts]
+x-mcp-lite = "x_mcp.twitter:mcp.run"
