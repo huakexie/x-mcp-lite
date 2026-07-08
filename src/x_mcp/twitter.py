@@ -4,6 +4,7 @@ import json
 import logging
 from fastmcp import FastMCP
 from fastmcp.server import Context
+from . import twikit_patch  # noqa: F401  must run before `import twikit`
 import twikit
 import os
 from pathlib import Path
