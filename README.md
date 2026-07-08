@@ -2,6 +2,8 @@
 
 Safety-focused lite fork of [`lord-dubious/x-mcp`](https://github.com/lord-dubious/x-mcp).
 
+> **Note on AI involvement**: This fork was authored by Claude Code (Anthropic) under human direction. The human collaborator (`huakexie`) made all product decisions — scope of cuts, naming, design tradeoffs (in-memory vs SQLite, active cooldown vs passive sleep, retry vs no-retry on 429, etc.) — and reviewed/verified the code at each step. Claude Code did the source reading, pattern analysis, and mechanical refactoring (commenting decorators, wrapping calls with `with_rate_limit`, writing the `throttle.py` module). The anti-rate-limit design is informed by reading [`DataWhisker/x-mcp-server`](https://github.com/DataWhisker/x-mcp-server)'s official-API rate-limit module and adapting its "learn from real 429 + active intercept" pattern to twikit's reverse-engineered endpoints.
+
 Keeps the read-only tools + bookmark/like management, **cuts** the high-risk write tools (post/delete tweets, DM, follow/block/mute, groups, cookie ops), and adds an **anti-rate-limit layer** the original project lacks entirely.
 
 ## ⚠️ Risk warning
