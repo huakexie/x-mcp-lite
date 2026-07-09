@@ -117,16 +117,32 @@ Reads, validates, and atomically writes to `X_MCP_COOKIES_PATH`. Refuses if sour
 Best when you don't have cookies yet and want to log into Twitter fresh.
 
 1. Ensure `TWITTER_USERNAME` / `TWITTER_PASSWORD` are set in MCP server env (required — agents can't pass these at runtime)
-2. Call `get_cookie(proxy="<residential proxy URL>")` — `proxy` is optional; falls back to `X_MCP_PROXY` env var, then direct connection
+2. Either:
+   - Call `get_cookie(proxy="<residential HTTP proxy URL>")` — for HTTP/SOCKS5 proxies (e.g. linktube residential)
+   - Call `set_proxy(outbound="<sing-box outbound JSON>")` first, then `get_cookie()` with no args — for non-HTTP protocols (trojan/anytls/ss/etc). sing-box is auto-downloaded, started as a local HTTP proxy, and auto-cleaned after `get_cookie` succeeds.
 
 twikit logs in via the chosen proxy (or direct), saves cookies to `X_MCP_COOKIES_PATH`. On residential IPs, direct works. On datacenter IPs, you need a residential proxy or you'll get 403.
 
+#### `set_proxy` for non-HTTP protocols
+
+If you only have trojan/anytls/ss nodes (no HTTP proxy URL), use `set_proxy`:
+
+```python
+# Agent passes a sing-box outbound JSON
+await set_proxy(outbound='{"type":"trojan","server":"...","server_port":443,"password":"...","tls":{"enabled":true,"server_name":"..."}}')
+
+# Then call get_cookie() — it picks up the local proxy automatically
+await get_cookie()
+```
+
+sing-box binary is downloaded to `~/.x-mcp/singbox-bin/` on first use (tries github.com first, then mirrors, then a user-installed `sing-box` in PATH). After `get_cookie` succeeds, sing-box is stopped and the downloaded binary deleted. Pass `None` to `set_proxy` to stop manually.
+
 ### Agent self-service flow
 
-When an agent calls any tool (e.g. `get_bookmarks`) and cookies are missing/expired, the error message includes a guided PATH A / B / C choice. The agent can then:
-- Pass `proxy="<url>"` to `get_cookie()` to auto-login on this machine (PATH A)
-- Ask the user to run `get_cookie()` on another machine and paste back the JSON via `cookie_json=` (PATH B)
-- Ask the user to paste browser-exported cookies via `cookie_json=` (PATH C)
+When an agent calls any tool (e.g. `get_bookmarks`) and cookies are missing/expired, the error message tells the agent to call `get_cookie`. The agent then either:
+- Asks the user for an HTTP/SOCKS5 proxy URL and calls `get_cookie(proxy="<url>")`
+- Asks the user for a non-HTTP node config and calls `set_proxy(outbound="<sing-box JSON>")` then `get_cookie()`
+- Asks the user to paste cookies from elsewhere (browser export or another machine) and calls `get_cookie(cookie_json="<JSON>")`
 
 If `TWITTER_USERNAME` / `TWITTER_PASSWORD` are missing, the error tells the user to restart the MCP server with these env vars configured.
 

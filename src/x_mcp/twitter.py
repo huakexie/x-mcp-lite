@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional, Union
+import atexit
 import time
 import json
 import logging
@@ -13,10 +14,14 @@ import time
 import json
 
 from .throttle import get_throttler, with_rate_limit, paginate_all, COOKIE_GUIDE
+from . import singbox
 
 # Create an MCP server with proper metadata
 mcp = FastMCP()
 throttler = get_throttler()
+
+# Clean up any running singbox process when the MCP server exits.
+atexit.register(singbox.stop_singbox)
 
 logger = logging.getLogger(__name__)
 httpx_logger = logging.getLogger("httpx")
@@ -244,27 +249,76 @@ async def get_cookie(
             "[ERROR] Missing TWITTER_USERNAME / TWITTER_PASSWORD in MCP server env. "
             "The user must restart the MCP server with these env vars configured."
         )
-    # If proxy wasn't passed and X_MCP_PROXY isn't set, ask the user for one.
-    if proxy is None and not PROXY_URL:
+    # Priority: explicit proxy arg > singbox active proxy (from set_proxy) >
+    # X_MCP_PROXY env var > direct connection.
+    active = singbox.get_active_proxy()
+    if proxy is not None:
+        effective_proxy = proxy
+    elif active is not None:
+        effective_proxy = active
+    elif PROXY_URL:
+        effective_proxy = PROXY_URL
+    else:
         return (
             "Provide a residential proxy URL to route the login through. "
             "Format: http://user:pass@host:port or socks5://host:port.\n"
             "Pass it as the `proxy` argument: get_cookie(proxy=\"<the URL>\").\n"
+            "Or use set_proxy(outbound=\"<sing-box outbound JSON>\") to start a "
+            "local HTTP proxy from a non-HTTP protocol (trojan/anytls/ss/etc).\n"
             "This is a network proxy address, not an X account credential — "
             "TWITTER_USERNAME and TWITTER_PASSWORD stay inside the MCP server env."
         )
-    effective_proxy = proxy if proxy is not None else PROXY_URL
-    if proxy is None and PROXY_URL:
-        logger.info("Using X_MCP_PROXY env var as proxy (no `proxy` arg passed).")
     try:
-        client = await get_twitter_client(proxy=proxy)
+        client = await get_twitter_client(proxy=effective_proxy)
     except Exception as e:
         return f"[ERROR] Auto-login failed: {e}"
+    # Auto-cleanup singbox if it was started by set_proxy (one-shot pattern).
+    if singbox.get_active_proxy() is not None:
+        singbox.stop_singbox()
     return (
         f"Cookies saved to {COOKIES_PATH} via auto-login"
         f"{' via proxy ' + effective_proxy if effective_proxy else ' (direct)'}.\n"
         f"On a deployment machine, copy this file there and set X_MCP_COOKIES_PATH to its path. "
         f"No proxy needed on the deployment side."
+    )
+
+
+@mcp.tool()
+async def set_proxy(
+    outbound: Optional[str] = None,
+) -> str:
+    """Configure the proxy used by get_cookie() for the next auto-login.
+
+    Pass an `outbound` JSON string (a sing-box outbound config, e.g. trojan/
+    anytls/ss). This will:
+      1. Download the sing-box binary to ~/.x-mcp/singbox-bin/ if not already
+         installed (tries github.com first, then mirrors; falls back to a
+         user-installed `sing-box` in PATH).
+      2. Start sing-box as a local HTTP inbound (127.0.0.1:<random port>),
+         routing through the given outbound.
+      3. Set the local HTTP URL as the active proxy for get_cookie().
+
+    Pass None (or call with no args) to stop sing-box, delete the downloaded
+    binary, and clear the active proxy.
+
+    Typical agent flow:
+      1. Call set_proxy(outbound="<sing-box outbound JSON>")
+      2. Call get_cookie() — uses the local proxy automatically, logs into
+         Twitter, saves cookies, and auto-stops sing-box.
+      3. Retry the original call (e.g. get_bookmarks).
+    """
+    if outbound is None:
+        singbox.stop_singbox()
+        return "Proxy cleared. sing-box stopped, binary deleted (if managed)."
+    try:
+        proxy_url = singbox.start_singbox(outbound)
+    except Exception as e:
+        # Make sure no half-state remains.
+        singbox.stop_singbox()
+        return f"[ERROR] {e}"
+    return (
+        f"Local HTTP proxy started at {proxy_url}. "
+        f"Call get_cookie() now to login via this proxy; it will auto-stop sing-box on success."
     )
 
 
