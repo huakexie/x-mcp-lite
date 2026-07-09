@@ -7,7 +7,7 @@ Safety-focused lite fork of [`lord-dubious/x-mcp`](https://github.com/lord-dubio
 Keeps the read-only tools + bookmark/like management, **cuts** the high-risk write tools (post/delete tweets, DM, follow/block/mute, groups, cookie ops), and adds:
 
 - An **anti-rate-limit layer** the original project lacks entirely
-- A **twikit 2.3.3 patch** for the upstream `KEY_BYTE indices` breakage (x.com changed homepage HTML format on 2026-03-18, twikit hasn't shipped a fix)
+- **twikit 2.3.3 patches** for two upstream bugs it hasn't shipped fixes for: the `KEY_BYTE indices` breakage (x.com changed homepage HTML format on 2026-03-18) and `KeyError` crashes when parsing users/tweets whose accounts omit optional `legacy.*` fields (e.g. accounts with no bio link → `KeyError: 'urls'`)
 - A **cookie-based auth flow** (`get_cookie`) so the server can run on datacenter IPs without triggering Cloudflare blocks
 
 ---
@@ -57,16 +57,20 @@ Post/delete tweets, polls, scheduled tweets, retweets, all DM write operations, 
 ```
 src/x_mcp/
 ├── __init__.py
-├── twikit_patch.py   # Patches twikit 2.3.3 ClientTransaction.get_indices
-│                     # for the 2026-03-18 x.com HTML format change.
+├── twikit_patch.py   # Two twikit 2.3.3 monkey-patches, applied at import:
+│                     # - ClientTransaction.get_indices (2026-03-18 x.com
+│                     #   HTML format change)
+│                     # - User.__init__ (KeyError on optional legacy.*
+│                     #   fields x.com omits, e.g. no-bio-link accounts)
 │                     # Loaded BEFORE `import twikit` via twitter.py.
-├── throttle.py       # Anti-rate-limit layer:
-│                     # - Throttler (2-5s random pacing, memory)
-│                     # - with_rate_limit (active cooldown tracking,
-│                     #   429 retry with real reset time, no-retry on
-│                     #   other TwitterException subtypes — just attach
-│                     #   the "Call get_cookie()" hint)
-│                     # - paginate_all (3-8s inter-page delay)
+├── throttle.py       # Anti-rate-limit layer (state persisted to
+│                     # ~/.x-mcp/throttle_state.json):
+│                     # - Throttler (2-5s random pacing, persisted)
+│                     # - with_rate_limit (rolling request budget +
+│                     #   active cooldown + bounded 429 backoff/retry;
+│                     #   distinct AccountLocked/Suspended handling;
+│                     #   get_cookie hint on other TwitterException)
+│                     # - paginate_all (3-8s inter-page delay, budget-aware)
 ├── singbox.py        # Archived: historical sing-box management module.
 │                     # No longer imported by twitter.py. Kept in the repo
 │                     # (and git history) as a record of the proxy/sing-box
@@ -78,22 +82,44 @@ src/x_mcp/
 
 ### Anti-rate-limit layer (`throttle.py`)
 
-1. **`Throttler`** — random-pacing throttler (in-memory). Every tool call awaits `throttler.wait()` first, which sleeps to enforce a 2–5s random interval since the last call. Randomization avoids fixed-pattern detection.
+1. **`Throttler`** — random-pacing throttler. Every tool call awaits `throttler.wait()` first, which sleeps to enforce a 2–5s random interval since the last call. Randomization avoids fixed-pattern detection. The last-call timestamp is **persisted**, so pacing holds even when the host spawns the server fresh per call.
 
-2. **`with_rate_limit(endpoint, fn)`** — DataWhisker-style active cooldown tracking (in-memory dict).
-   - Before calling: if a previous 429 recorded a reset time for this endpoint, sleep until that time (active intercept — no wasted request).
-   - On `TooManyRequests`: read `e.rate_limit_reset` (from the `x-rate-limit-reset` response header, confirmed in twikit 2.3.3 `errors.py`), record it, sleep, retry once.
-   - On any other `TwitterException` subtype (`BadRequest` / `Unauthorized` / `Forbidden` / `NotFound` / `AccountLocked` / `AccountSuspended` / etc): convert to `RuntimeError` with a short "Call get_cookie()" hint, do not retry. Catching the base class means we don't have to enumerate every subtype — x.com sometimes returns 404 on datacenter-IP login, which twikit raises as `NotFound`; the base catch handles it.
+2. **`with_rate_limit(endpoint, fn)`** — DataWhisker-style active cooldown tracking, plus a request budget and bounded backoff. In order:
+   - **Rolling budget**: if we've already made `X_MCP_MAX_CALLS_PER_WINDOW` calls (default 250) in the last 15 min, refuse with a clear "try again in Ns" error instead of adding fuel to a burst that could trip detection. Set to `0` to disable.
+   - **Active cooldown**: if a previous 429 recorded a reset time for this endpoint, either sleep it out (if within `X_MCP_MAX_BACKOFF`) or refuse with a retry hint (if further out) — active intercept, no wasted request.
+   - On `TooManyRequests`: read `e.rate_limit_reset` (from the `x-rate-limit-reset` response header, confirmed in twikit 2.3.3 `errors.py`), record it (persisted), then **sleep + retry once only if the wait is within `X_MCP_MAX_BACKOFF`** (default 60s); otherwise refuse with a retry hint. This caps in-call blocking so a single call can't hang for the full 900s window and blow past your MCP client's timeout — the cooldown is still honored on the next call.
+   - On `AccountLocked` / `AccountSuspended`: convert to a `RuntimeError` that says re-cookieing **won't** help and the account must be fixed manually in a browser (no misleading `get_cookie()` hint).
+   - On any other `TwitterException` subtype (`BadRequest` / `Unauthorized` / `Forbidden` / `NotFound` / etc): convert to `RuntimeError` with the short "Call get_cookie()" hint, do not retry.
 
-3. **`paginate_all`** — for `get_all_bookmarks`. Iterates `Result.next()` with 3–8s random delay between pages, auto-backoff on 429.
+3. **`paginate_all`** — for `get_all_bookmarks`. Iterates `Result.next()` with 3–8s random delay between pages; each page goes through `with_rate_limit` so the budget, cooldown and 429 backoff all apply, and any refusal cleanly stops pagination and returns what was collected so far. Default `max_pages=50` (~1000 bookmarks).
 
-**No persistence**: in-memory dicts only. Twitter's rate-limit window is 15 min; for low-frequency usage, restart intervals exceed the window anyway. Memory is also faster (no disk I/O).
+**Persistence**: pacing (`last_call`), per-endpoint 429 cooldowns (`resets`), and the rolling request log (`calls`) are stored in a small JSON file (default `~/.x-mcp/throttle_state.json`, override with `X_MCP_STATE_PATH`; atomic writes, tolerant of a missing/corrupt file). This is what lets a cooldown survive across per-session server spawns (e.g. mcphub over stdio), instead of being lost every time the process restarts.
 
-### twikit patch (`twikit_patch.py`)
+### Remaining limitations
 
-twikit 2.3.3's `ClientTransaction.get_indices` raises `Couldn't get KEY_BYTE indices` because x.com changed its homepage HTML on 2026-03-18 — the `ondemand.s` filename and its hash are now split into two separate `,<N>:"..."` entries instead of one inline `"ondemand.s":"<hash>"`. Upstream issue: [`d60/twikit#408`](https://github.com/d60/twikit/issues/408). Fix is upstream in [`iSarabjitDhiman/XClientTransaction`](https://github.com/iSarabjitDhiman/XClientTransaction) commit `2ff8438`, but twikit hasn't pulled it in.
+Documented so you know what the layer still does **not** cover:
 
-`twikit_patch.py` monkey-patches `ClientTransaction.get_indices` at import time using the regex from [`@audioeng89`'s comment](https://github.com/d60/twikit/issues/408#issuecomment-4089055868). Must run before `from twikit import Client`. Remove this module once twikit ships a fixed release.
+- **Budget/pacing count tool calls, not underlying HTTP requests.** Some tools issue several requests internally (e.g. `get_user` does `settings` + `get_user_by_screen_name` + `get_user_by_id`) but count as one. The budget is a coarse safety cap, not an exact request meter.
+- **No fingerprint hardening.** The client uses twikit's default User-Agent unless you set `USER_AGENT`. If you exported cookies from a browser, setting `USER_AGENT` to match that browser is the most consistent choice.
+- **`get_user` / `get_user_id` depend on a flaky endpoint.** They call `/1.1/account/settings.json`, which x.com currently returns `404` for intermittently. This is an x.com/twikit issue, not a rate-limit one — retry, or use `get_user_by_screen_name` / `get_bookmarks` which don't hit that endpoint.
+- **Concurrent writers race.** The state file is best-effort: two servers running against the same file could lose an update. Fine for the normal single-host case.
+
+### twikit patches (`twikit_patch.py`)
+
+`twikit_patch.py` applies two independent monkey-patches at import time (must run before `from twikit import Client`). Remove each once twikit ships a release that fixes the corresponding bug.
+
+**1. `ClientTransaction.get_indices` — `Couldn't get KEY_BYTE indices`**
+
+twikit 2.3.3 raises this because x.com changed its homepage HTML on 2026-03-18 — the `ondemand.s` filename and its hash are now split into two separate `,<N>:"..."` entries instead of one inline `"ondemand.s":"<hash>"`. Upstream issue: [`d60/twikit#408`](https://github.com/d60/twikit/issues/408). Fix is upstream in [`iSarabjitDhiman/XClientTransaction`](https://github.com/iSarabjitDhiman/XClientTransaction) commit `2ff8438`, but twikit hasn't pulled it in. Patched using the regex from [`@audioeng89`'s comment](https://github.com/d60/twikit/issues/408#issuecomment-4089055868).
+
+**2. `User.__init__` — `KeyError` on optional `legacy.*` fields**
+
+twikit 2.3.3's `User.__init__` hard-indexes many optional `legacy.*` fields that x.com omits for some accounts, so any call that parses a User object crashes. Observed in the wild:
+
+- `legacy['entities']['description']['urls']` for accounts with **no link in their bio** (x.com sends `entities == {"description": {}}`) → `KeyError: 'urls'`
+- `legacy['withheld_in_countries']` → `KeyError: 'withheld_in_countries'`
+
+This hit `get_user`, `get_user_id`, `get_bookmarks`, timelines, follower lists — anything returning users. Same class of bug as [`d60/twikit#341`](https://github.com/d60/twikit/pull/341) (`can_media_tag`). Rather than whack-a-mole each field, the patch wraps the incoming `data` in a recursive lenient dict so a missing key at any depth degrades to an empty value instead of raising; present keys keep their real values, so normal accounts parse unchanged.
 
 ### Why there is no proxy support
 
@@ -135,8 +161,11 @@ cd x-mcp-lite
 | `TWITTER_PASSWORD` | Yes¹ | — | X password (used by auto-login) |
 | `TWITTER_EMAIL` | No | — | Email if your account has one; omitted if not set (twikit accepts `auth_info_2=None`) |
 | `X_MCP_COOKIES_PATH` | No | `~/.x-mcp/cookies.json` | Path to cookies file. Set this on both the login machine and the deployment machine. |
-| `USER_AGENT` | No | twikit default | Custom User-Agent |
+| `USER_AGENT` | No | twikit default | Custom User-Agent. Recommended: match the browser you exported cookies from. |
 | `CAPSOLVER_API_KEY` | No | — | Capsolver API key (only needed if you hit Arkose challenges) |
+| `X_MCP_STATE_PATH` | No | `~/.x-mcp/throttle_state.json` | Where the throttle layer persists pacing / cooldowns / request log |
+| `X_MCP_MAX_BACKOFF` | No | `60` | Max seconds a single call will block waiting out a cooldown before it refuses with a retry hint (the cooldown is still persisted) |
+| `X_MCP_MAX_CALLS_PER_WINDOW` | No | `250` | Client-side request budget per 15-min window. `0` disables the cap |
 
 ¹ Only required if you ever use `get_cookie()` Strategy 3 (auto-login). If you only ever paste cookies via `get_cookie(cookie_json=...)`, credentials aren't needed.
 
@@ -224,9 +253,25 @@ The server's IP is blocked by Cloudflare. x-mcp-lite no longer supports proxy-ba
 
 Cookies are missing or expired. Call `get_cookie()` to refresh (see Cookie setup above).
 
-### `Account locked` (Arkose challenge)
+### `Account locked` (Arkose challenge) / `Account suspended`
 
-The account got flagged by Twitter's anti-automation. Stop, log into x.com in a browser, complete the challenge, then re-run `get_cookie` to refresh cookies.
+The account got flagged by Twitter's anti-automation. Re-cookieing will **not** help. Stop all automated calls, log into x.com in a browser, complete the challenge (locked) or appeal (suspended), then — only for a lock — re-run `get_cookie` to refresh cookies.
+
+### `Client-side request budget exceeded`
+
+You've hit the built-in safety cap (`X_MCP_MAX_CALLS_PER_WINDOW`, default 250 calls / 15 min). Wait the stated number of seconds, or raise/disable the cap via the env var. This is a *client-side* guard, not an X rate limit.
+
+### `... is rate-limited; cooldown ends in Ns`
+
+X returned a 429 and the reset is further out than `X_MCP_MAX_BACKOFF` (default 60s), so the call refused instead of blocking. The cooldown is persisted (`X_MCP_STATE_PATH`) and honored automatically — just retry after the stated time. Raise `X_MCP_MAX_BACKOFF` if you'd rather have calls block and auto-retry.
+
+### `KeyError: 'urls'` / `KeyError` while reading users or bookmarks
+
+Fixed by the `User.__init__` patch in `twikit_patch.py` (see [twikit patches](#twikit-patches-twikit_patchpy)). If you still see it, the patch isn't loaded — confirm `twitter.py` imports `twikit_patch` before `import twikit`.
+
+### `get_user` / `get_user_id` return `NotFound (404 "page does not exist")`
+
+These go through `/1.1/account/settings.json`, which x.com returns 404 for intermittently. It's not a rate-limit or cookie problem — retry, or use `get_user_by_screen_name` / `get_bookmarks`, which don't hit that endpoint.
 
 ---
 

@@ -960,12 +960,15 @@ async def get_bookmarks(
 async def get_all_bookmarks(
     folder_id: Optional[str] = None,
     page_size: int = 20,
-    max_pages: int = 200,
+    max_pages: int = 50,
     page_delay_range: tuple[float, float] = (3.0, 8.0),
 ) -> str:
     """Read all bookmarks by paginating until end or max_pages reached.
 
-    Built-in anti-rate-limit: 3-8s random delay between pages, 429 auto-backoff.
+    Built-in anti-rate-limit: 3-8s random delay between pages, 429 auto-backoff,
+    and the shared client-side request budget. Defaults to 50 pages (~1000
+    bookmarks); raise max_pages explicitly if you have more and accept the
+    longer, higher-risk run.
     Returns markdown of all collected tweets.
     """
     await throttler.wait()
