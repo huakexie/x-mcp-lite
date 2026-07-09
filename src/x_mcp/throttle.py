@@ -35,25 +35,28 @@ T = TypeVar("T")
 # Cookie setup guidance shown when auth fails. Shared between with_rate_limit
 # (which raises RuntimeError carrying this) and get_cookie (which returns it).
 COOKIE_GUIDE = """\
-To set up cookies, choose one of these two paths:
+To set up cookies, choose one of these paths:
 
-PATH A: Get cookies on a residential-IP machine (e.g. your laptop), then deploy
-  1. On a machine with residential IP (optionally behind a VPN/proxy):
-     - Set X_MCP_PROXY to a residential proxy URL (http:// or socks5://)
-       if you have one; otherwise direct connection works if the machine
-       is already on a residential IP.
-     - Set TWITTER_USERNAME / TWITTER_EMAIL / TWITTER_PASSWORD
-     - Call get_cookie() with no args
-  2. Copy the saved file (default ~/.x-mcp/cookies.json) to this machine
-  3. Set X_MCP_COOKIES_PATH to its absolute path here
-  No proxy needed on this machine after that.
+PATH A: Get cookies on this machine (you have a residential proxy URL)
+  - Ensure TWITTER_USERNAME / TWITTER_PASSWORD are set in the MCP server env
+  - Call get_cookie(proxy="<residential proxy URL>")
+    (e.g. http://user:pass@host:port or socks5://host:port)
+  - Cookies will be saved to X_MCP_COOKIES_PATH on this machine
 
-PATH B: Provide a proxy here, let this machine auto-login
-  1. Set X_MCP_PROXY to a residential proxy URL
-     (e.g. http://user:pass@residential-proxy:8080 or socks5://...)
-  2. Set TWITTER_USERNAME / TWITTER_EMAIL / TWITTER_PASSWORD
-  3. Call get_cookie() with no args
-  Cookies will be saved to X_MCP_COOKIES_PATH here.
+PATH B: Get cookies on another machine, transfer here
+  - On a residential-IP machine, install x-mcp-lite and call get_cookie()
+    with the same proxy argument (or direct if that machine is residential)
+  - Read the saved cookies file (it's JSON)
+  - Call get_cookie(cookie_json="<the JSON content>") here
+  - Cookies will be saved to X_MCP_COOKIES_PATH on this machine
+
+PATH C: Paste cookies you already have
+  - If you've exported cookies from a browser (e.g. EditThisCookie on x.com)
+  - Call get_cookie(cookie_json="<the JSON string>") here
+
+If TWITTER_USERNAME / TWITTER_PASSWORD are missing:
+  Restart the MCP server with these env vars configured, then retry.
+  Without credentials, only PATH C works (paste cookies from elsewhere).
 """
 
 
