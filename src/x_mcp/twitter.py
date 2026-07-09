@@ -67,15 +67,10 @@ async def get_twitter_client(proxy: Optional[str] = None) -> twikit.Client:
       proxy: optional proxy URL for this call. Overrides X_MCP_PROXY env var.
               Used by get_cookie() to let agents pass a proxy at runtime.
 
-    Login failures are wrapped with a cookie-setup guide so that agents
-    seeing 403/401/AccountLocked can self-serve via get_cookie(proxy=...).
+    Login failures are wrapped with a cookie-setup hint so that agents
+    seeing 400/401/403/404/AccountLocked/etc can self-serve via get_cookie.
     """
-    from twikit.errors import (
-        AccountLocked,
-        AccountSuspended,
-        Forbidden,
-        Unauthorized,
-    )
+    from twikit.errors import TwitterException
 
     effective_proxy = proxy if proxy is not None else PROXY_URL
     captcha_solver = None
@@ -101,15 +96,16 @@ async def get_twitter_client(proxy: Optional[str] = None) -> twikit.Client:
             if EMAIL:
                 login_kwargs["auth_info_2"] = EMAIL
             await client.login(**login_kwargs)
-        except (AccountLocked, AccountSuspended, Forbidden, Unauthorized) as e:
-            # Auth-related failures: tell the agent to call get_cookie.
+        except TwitterException as e:
+            # Any twikit Twitter API error during login: 400/401/403/404/429/etc.
+            # Tell the agent to call get_cookie so it can self-serve.
             logger.error(f"Login failed ({type(e).__name__}): {e}")
             raise RuntimeError(
                 f"[ERROR] Login failed ({type(e).__name__}): {e}. "
                 + COOKIE_GUIDE
             )
         except Exception as e:
-            # Unknown failure: don't wrap, but prefix so it's clearly an error.
+            # Non-twikit failure (network error, etc): prefix so it's clearly an error.
             logger.error(f"Failed to login: {e}")
             raise RuntimeError(f"[ERROR] Login failed: {type(e).__name__}: {e}")
         COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)

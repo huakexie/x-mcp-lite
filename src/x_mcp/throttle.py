@@ -18,11 +18,8 @@ import time
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
 from twikit.errors import (
-    AccountLocked,
-    AccountSuspended,
-    Forbidden,
     TooManyRequests,
-    Unauthorized,
+    TwitterException,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,20 +95,11 @@ async def with_rate_limit(
             )
         await asyncio.sleep(wait_s)
         return await with_rate_limit(endpoint, fn, max_retries=max_retries - 1)
-    except AccountLocked as e:
+    except TwitterException as e:
+        # Any twikit Twitter API error: 400/401/403/404/AccountLocked/etc.
+        # Tell the agent to call get_cookie so it can self-serve.
         raise RuntimeError(
-            f"[ERROR] Account locked, requires manual verification (Arkose challenge): {e}. "
-            + COOKIE_GUIDE
-        )
-    except AccountSuspended as e:
-        raise RuntimeError(f"[ERROR] Account suspended: {e}")
-    except Unauthorized as e:
-        raise RuntimeError(
-            f"[ERROR] Unauthorized (401): {e}. " + COOKIE_GUIDE
-        )
-    except Forbidden as e:
-        raise RuntimeError(
-            f"[ERROR] Forbidden (403): {e}. " + COOKIE_GUIDE
+            f"[ERROR] {type(e).__name__}: {e}. " + COOKIE_GUIDE
         )
 
 
