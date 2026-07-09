@@ -46,10 +46,13 @@ MIRRORS = [
 
 # In-process state. _proc is the running singbox subprocess; _is_managed
 # records whether we downloaded the binary ourselves (so we know it's safe
-# to delete on cleanup).
+# to delete on cleanup). _cfg_path is the temp config file, cleaned up
+# alongside the process in stop_singbox() — we can't delete it immediately
+# after Popen because sing-box may still be reading it (Popen is async).
 _proc: Optional[subprocess.Popen] = None
 _is_managed: bool = False
 _active_proxy: Optional[str] = None  # e.g. "http://127.0.0.1:54321"
+_cfg_path: Optional[str] = None
 
 
 def _platform_asset() -> str:
@@ -220,23 +223,22 @@ def start_singbox(outbound_json: str) -> str:
 
     binary, _is_managed = _resolve_binary()
 
-    # Write config to tmp file; delete after singbox starts.
+    # Write config to tmp file. NOTE: we cannot delete it right after
+    # Popen because subprocess.Popen returns immediately — sing-box may
+    # still be reading the file. Instead, keep the path in _cfg_path and
+    # clean it up in stop_singbox() (or on MCP server exit via atexit).
+    global _cfg_path
     fd, cfg_path = tempfile.mkstemp(suffix=".json")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(config, f)
-        _proc = subprocess.Popen(
-            [binary, "run", "-c", cfg_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-    finally:
-        # singbox reads config at startup, safe to delete now.
-        try:
-            os.unlink(cfg_path)
-        except OSError:
-            pass
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f)
+    _cfg_path = cfg_path
+
+    _proc = subprocess.Popen(
+        [binary, "run", "-c", cfg_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
 
     try:
         port = _read_port_from_stderr(_proc, timeout=10.0)
@@ -250,8 +252,8 @@ def start_singbox(outbound_json: str) -> str:
 
 
 def stop_singbox() -> None:
-    """Stop singbox process + delete binary if we downloaded it."""
-    global _proc, _is_managed, _active_proxy
+    """Stop singbox process + delete binary + delete config file."""
+    global _proc, _is_managed, _active_proxy, _cfg_path
     if _proc is not None:
         try:
             _proc.terminate()
@@ -270,6 +272,14 @@ def stop_singbox() -> None:
         except OSError as e:
             logger.warning(f"[singbox] failed to delete binary: {e}")
     _is_managed = False
+
+    if _cfg_path is not None:
+        try:
+            os.unlink(_cfg_path)
+        except OSError:
+            pass
+        _cfg_path = None
+
     _active_proxy = None
 
 
