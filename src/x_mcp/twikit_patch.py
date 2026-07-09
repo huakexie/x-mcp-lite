@@ -110,3 +110,49 @@ def _patched_user_init(self, client, data):
 
 
 _user_mod.User.__init__ = _patched_user_init
+
+
+# --- tweet_detail: KeyError 'itemContent' from flattened cursor entries ---
+#
+# twikit 2.3.3 reads reply/next cursors from the tweet_detail response at
+#   entries[-1]['content']['itemContent']['value']  and
+#   reply['item']['itemContent']['value']
+# (in Client.get_tweet_by_id and Client._get_more_replies). x.com flattened
+# cursor entries: the value now sits directly on the cursor object as
+# {'entryType': 'TimelineTimelineCursor', 'cursorType': ..., 'value': ...} with
+# no 'itemContent' nesting -> KeyError: 'itemContent'. This breaks the
+# get_tweet_by_id / get_tweet_details / get_conversation_thread tools.
+#
+# All three crash sites parse the response returned by GQLClient.tweet_detail,
+# so we patch that one method: walk the response and re-nest each flattened
+# cursor's value back under 'itemContent' so the original code works unchanged.
+#
+# Remove once twikit handles the flattened cursor shape.
+_gql_mod = __import__("twikit.client.gql", fromlist=["GQLClient"])
+_orig_tweet_detail = _gql_mod.GQLClient.tweet_detail
+
+
+def _restore_cursor_itemcontent(obj) -> None:
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _restore_cursor_itemcontent(v)
+        if "cursorType" in obj and "value" in obj and "itemContent" not in obj:
+            obj["itemContent"] = {
+                "cursorType": obj.get("cursorType"),
+                "value": obj.get("value"),
+            }
+    elif isinstance(obj, list):
+        for v in obj:
+            _restore_cursor_itemcontent(v)
+
+
+async def _patched_tweet_detail(self, tweet_id, cursor):
+    result = await _orig_tweet_detail(self, tweet_id, cursor)
+    try:
+        _restore_cursor_itemcontent(result[0])
+    except (TypeError, IndexError, KeyError):
+        pass
+    return result
+
+
+_gql_mod.GQLClient.tweet_detail = _patched_tweet_detail

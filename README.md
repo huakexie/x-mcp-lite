@@ -7,7 +7,7 @@ Safety-focused lite fork of [`lord-dubious/x-mcp`](https://github.com/lord-dubio
 Keeps the read-only tools + bookmark/like management, **cuts** the high-risk write tools (post/delete tweets, DM, follow/block/mute, groups, cookie ops), and adds:
 
 - An **anti-rate-limit layer** the original project lacks entirely
-- **twikit 2.3.3 patches** for two upstream bugs it hasn't shipped fixes for: the `KEY_BYTE indices` breakage (x.com changed homepage HTML format on 2026-03-18) and `KeyError` crashes when parsing users/tweets whose accounts omit optional `legacy.*` fields (e.g. accounts with no bio link → `KeyError: 'urls'`)
+- **twikit 2.3.3 patches** for three upstream bugs it hasn't shipped fixes for: the `KEY_BYTE indices` breakage (x.com changed homepage HTML on 2026-03-18), `KeyError` crashes when parsing users whose accounts omit optional `legacy.*` fields (e.g. no bio link → `KeyError: 'urls'`), and `KeyError: 'itemContent'` in `get_tweet_by_id` from x.com's flattened cursor entries
 - A **cookie-based auth flow** (`get_cookie`) so the server can run on datacenter IPs without triggering Cloudflare blocks
 
 ---
@@ -57,11 +57,13 @@ Post/delete tweets, polls, scheduled tweets, retweets, all DM write operations, 
 ```
 src/x_mcp/
 ├── __init__.py
-├── twikit_patch.py   # Two twikit 2.3.3 monkey-patches, applied at import:
+├── twikit_patch.py   # Three twikit 2.3.3 monkey-patches, applied at import:
 │                     # - ClientTransaction.get_indices (2026-03-18 x.com
 │                     #   HTML format change)
 │                     # - User.__init__ (KeyError on optional legacy.*
 │                     #   fields x.com omits, e.g. no-bio-link accounts)
+│                     # - GQLClient.tweet_detail (KeyError itemContent from
+│                     #   x.com's flattened cursor entries)
 │                     # Loaded BEFORE `import twikit` via twitter.py.
 ├── throttle.py       # Anti-rate-limit layer (state persisted to
 │                     # ~/.x-mcp/throttle_state.json):
@@ -106,7 +108,7 @@ Documented so you know what the layer still does **not** cover:
 
 ### twikit patches (`twikit_patch.py`)
 
-`twikit_patch.py` applies two independent monkey-patches at import time (must run before `from twikit import Client`). Remove each once twikit ships a release that fixes the corresponding bug.
+`twikit_patch.py` applies three independent monkey-patches at import time (must run before `from twikit import Client`). Remove each once twikit ships a release that fixes the corresponding bug.
 
 **1. `ClientTransaction.get_indices` — `Couldn't get KEY_BYTE indices`**
 
@@ -120,6 +122,10 @@ twikit 2.3.3's `User.__init__` hard-indexes many optional `legacy.*` fields that
 - `legacy['withheld_in_countries']` → `KeyError: 'withheld_in_countries'`
 
 This hit `get_user`, `get_user_id`, `get_bookmarks`, timelines, follower lists — anything returning users. Same class of bug as [`d60/twikit#341`](https://github.com/d60/twikit/pull/341) (`can_media_tag`). Rather than whack-a-mole each field, the patch wraps the incoming `data` in a recursive lenient dict so a missing key at any depth degrades to an empty value instead of raising; present keys keep their real values, so normal accounts parse unchanged.
+
+**3. `tweet_detail` cursors — `KeyError: 'itemContent'`**
+
+twikit 2.3.3 reads reply/next-page cursors from the tweet-detail response at `entries[-1]['content']['itemContent']['value']` and `reply['item']['itemContent']['value']` (in `Client.get_tweet_by_id` and `Client._get_more_replies`). x.com **flattened** cursor entries — the value now sits directly on the cursor object (`{'entryType': 'TimelineTimelineCursor', 'cursorType': ..., 'value': ...}`) with no `itemContent` nesting → `KeyError: 'itemContent'`. This broke `get_tweet_by_id`, `get_tweet_details`, and `get_conversation_thread`. All the crash sites parse the response from `GQLClient.tweet_detail`, so the patch wraps that one method and re-nests each flattened cursor's value back under `itemContent`, leaving the original code unchanged.
 
 ### Why there is no proxy support
 
