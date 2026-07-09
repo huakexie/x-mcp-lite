@@ -65,12 +65,16 @@ src/x_mcp/
 │                     # - Throttler (2-5s random pacing, memory)
 │                     # - with_rate_limit (active cooldown tracking,
 │                     #   429 retry with real reset time, no-retry on
-│                     #   AccountLocked/Suspended)
+│                     #   other TwitterException subtypes — just attach
+│                     #   the "Call get_cookie()" hint)
 │                     # - paginate_all (3-8s inter-page delay)
-├── singbox.py        # sing-box binary download (github + 3 mirrors),
-│                     # config builder (HTTP inbound + user outbound),
-│                     # process management (start/stop/kill),
-│                     # auto-cleanup on success or exit.
+├── singbox.py        # sing-box binary download (httpx, github + 3
+│                     # mirrors), config builder (HTTP inbound + user
+│                     # outbound), process management (start/stop/kill),
+│                     # auto-cleanup on success or exit. Config file is
+│                     # kept until stop_singbox (not deleted right after
+│                     # Popen, since Popen is async and sing-box may
+│                     # still be reading it).
 └── twitter.py        # 40 MCP tools, all wrapped with throttler.wait()
                       # + with_rate_limit(). get_twitter_client handles
                       # cookie loading / login / proxy resolution.
@@ -83,7 +87,7 @@ src/x_mcp/
 2. **`with_rate_limit(endpoint, fn)`** — DataWhisker-style active cooldown tracking (in-memory dict).
    - Before calling: if a previous 429 recorded a reset time for this endpoint, sleep until that time (active intercept — no wasted request).
    - On `TooManyRequests`: read `e.rate_limit_reset` (from the `x-rate-limit-reset` response header, confirmed in twikit 2.3.3 `errors.py`), record it, sleep, retry once.
-   - On `AccountLocked` / `AccountSuspended` / `Unauthorized` / `Forbidden`: convert to `RuntimeError` with a short "Call get_cookie()" hint, do not retry.
+   - On any other `TwitterException` subtype (`BadRequest` / `Unauthorized` / `Forbidden` / `NotFound` / `AccountLocked` / `AccountSuspended` / etc): convert to `RuntimeError` with a short "Call get_cookie()" hint, do not retry. Catching the base class means we don't have to enumerate every subtype — x.com sometimes returns 404 on datacenter-IP login, which twikit raises as `NotFound`; the base catch handles it.
 
 3. **`paginate_all`** — for `get_all_bookmarks`. Iterates `Result.next()` with 3–8s random delay between pages, auto-backoff on 429.
 
@@ -99,11 +103,12 @@ twikit 2.3.3's `ClientTransaction.get_indices` raises `Couldn't get KEY_BYTE ind
 
 Used by `set_proxy(outbound=...)` to turn non-HTTP proxy protocols (trojan/anytls/ss/etc) into a local HTTP proxy that twikit/httpx can consume directly. Flow:
 
-1. Resolve binary: try `sing-box` in PATH first; if not found, download from github.com, then 3 mirrors (120s timeout each, both fail → tell user to install manually).
+1. Resolve binary: try `sing-box` in PATH first; if not found, download via `httpx` from github.com, then 3 mirrors (120s timeout each, all fail → tell user to install manually). We switched from `urllib.request` to `httpx` because `urllib` silently failed in containers (GitHub 302 redirects weren't followed).
 2. Build config: HTTP inbound on `127.0.0.1:0` (OS picks port) + user's outbound + route everything through it.
-3. Start subprocess; read actual port from stderr (10s timeout).
-4. Return `http://127.0.0.1:<port>` as the active proxy.
-5. On `stop_singbox()`: terminate → 5s → kill; delete downloaded binary if we managed it (PATH-installed binary is left alone).
+3. Write config to a tmp file. The path is stored in a module-level `_cfg_path` and cleaned up in `stop_singbox()` — **not** immediately after `Popen`, because `subprocess.Popen` is async and returns before sing-box has read the file.
+4. Start subprocess; read actual port from stderr (10s timeout).
+5. Return `http://127.0.0.1:<port>` as the active proxy.
+6. On `stop_singbox()`: terminate → 5s → kill; delete downloaded binary if we managed it (PATH-installed binary is left alone); delete the tmp config file.
 
 `atexit.register(singbox.stop_singbox)` ensures cleanup even if MCP server crashes.
 
@@ -265,9 +270,9 @@ from . import twikit_patch  # noqa: F401  must run before `import twikit`
 import twikit
 ```
 
-### `Forbidden (403)` on login
+### `Forbidden (403)` or `NotFound (404 "page does not exist")` on login
 
-The server is on a datacenter IP and Cloudflare blocked the login. Use `get_cookie(proxy="<proxy URL>")` (HTTP/HTTPS/SOCKS5) or `set_proxy(outbound="<sing-box JSON>")` + `get_cookie()` (trojan/anytls/ss/etc) to route login through any proxy that can reach x.com. Residential proxies are most reliable but any proxy works.
+Both mean the server's IP is blocked by Cloudflare — 403 is the explicit block, 404 is x.com returning a generic "page does not exist" body for blocked datacenter IPs. Use `get_cookie(proxy="<proxy URL>")` (HTTP/HTTPS/SOCKS5) or `set_proxy(outbound="<sing-box JSON>")` + `get_cookie()` (trojan/anytls/ss/etc) to route login through any proxy that can reach x.com. Residential proxies are most reliable but any proxy works.
 
 ### `Unauthorized (401)` on API calls
 
@@ -277,9 +282,13 @@ Cookies are missing or expired. Call `get_cookie()` to refresh (see Cookie setup
 
 The account got flagged by Twitter's anti-automation. Stop, log into x.com in a browser, complete the challenge, then re-run `get_cookie` to refresh cookies.
 
+### sing-box tmp config file: "no such file or directory"
+
+This was a bug where the tmp config was deleted immediately after `Popen` (Popen is async, so sing-box hadn't read it yet). Fixed in commit `44715b2` — config is now kept in `_cfg_path` and cleaned up by `stop_singbox()`. If you still see this error, your `uvx` cache is stale; restart the MCP host to re-pull.
+
 ### sing-box binary download fails
 
-Both github.com and all 3 mirrors timed out (120s each). Install manually:
+The `~/.x-mcp/singbox-bin/` directory ends up empty after `set_proxy`. This was a bug with `urllib.request` not following GitHub 302 redirects in some containers; fixed in commit `285bbfd` by switching to `httpx`. If you still see this, install manually:
 
 - macOS: `brew install sing-box`
 - Linux: download from [github.com/SagerNet/sing-box/releases](https://github.com/SagerNet/sing-box/releases), put the binary in your `PATH`.
