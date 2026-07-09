@@ -27,7 +27,10 @@ EMAIL = os.getenv("TWITTER_EMAIL")
 PASSWORD = os.getenv("TWITTER_PASSWORD")
 USER_AGENT = os.getenv("USER_AGENT")
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY")
-COOKIES_PATH = Path.home() / ".x-mcp" / "cookies.json"
+COOKIES_PATH = Path(
+    os.getenv("X_MCP_COOKIES_PATH", str(Path.home() / ".x-mcp" / "cookies.json"))
+)
+PROXY_URL = os.getenv("X_MCP_PROXY")  # None = direct connection
 
 # Rate limit tracking
 RATE_LIMITS: Dict[str, List[float]] = {}
@@ -48,17 +51,31 @@ def convert_tweets_to_markdown(tweets: Any) -> str:
 
 
 async def get_twitter_client() -> twikit.Client:
-    """Initialize and return an authenticated Twitter client."""
+    """Initialize and return an authenticated Twitter client.
+
+    Behavior:
+    - If X_MCP_COOKIES_PATH exists: load cookies from it (no login, no proxy needed).
+    - Otherwise: login with TWITTER_USERNAME/EMAIL/PASSWORD, optionally via X_MCP_PROXY.
+    """
     captcha_solver = None
     if CAPSOLVER_API_KEY:
         captcha_solver = twikit._captcha.capsolver.Capsolver(api_key=CAPSOLVER_API_KEY)
     client = twikit.Client(
-        "en-US", user_agent=USER_AGENT, captcha_solver=captcha_solver
+        "en-US",
+        user_agent=USER_AGENT,
+        captcha_solver=captcha_solver,
+        proxy=PROXY_URL,
     )
 
     if COOKIES_PATH.exists():
-        client.load_cookies(COOKIES_PATH)
+        client.load_cookies(str(COOKIES_PATH))
     else:
+        if not USERNAME or not PASSWORD:
+            raise RuntimeError(
+                "No cookies file found and missing TWITTER_USERNAME/TWITTER_PASSWORD. "
+                "Either set X_MCP_COOKIES_PATH to an existing cookies file, "
+                "or set TWITTER_USERNAME + TWITTER_PASSWORD (+ optionally X_MCP_PROXY for a residential proxy)."
+            )
         try:
             await client.login(
                 auth_info_1=USERNAME, auth_info_2=EMAIL, password=PASSWORD
@@ -67,7 +84,7 @@ async def get_twitter_client() -> twikit.Client:
             logger.error(f"Failed to login: {e}")
             raise
         COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        client.save_cookies(COOKIES_PATH)
+        client.save_cookies(str(COOKIES_PATH))
 
     return client
 
@@ -93,6 +110,102 @@ def check_rate_limit(endpoint: str) -> bool:
 
     limit = limits.get(endpoint, 100)  # Default to 100 for unknown endpoints
     return len(RATE_LIMITS[endpoint]) < limit
+
+
+@mcp.tool()
+async def get_cookie(
+    cookie_json: Optional[str] = None,
+    cookie_file: Optional[str] = None,
+) -> str:
+    """One-time cookie setup helper. Picks a strategy based on what you pass.
+
+    Strategies (in order):
+    1. cookie_json=<str>: write the JSON string directly to the cookies path.
+       Use this when you've exported cookies from a browser and pasted them here.
+    2. cookie_file=<path>: copy a local file to the cookies path.
+       Use this when you've already saved cookies somewhere on this machine.
+    3. Neither: perform a fresh twikit login, using X_MCP_PROXY if set
+       (residential proxy recommended), and save the resulting cookies.
+
+    After this tool succeeds, the cookies file at X_MCP_COOKIES_PATH is ready.
+    On a deployment machine, just copy the file there and set X_MCP_COOKIES_PATH
+    accordingly; no proxy needed on the deployment side.
+    """
+    import tempfile
+
+    # Strategy 1: paste JSON
+    if cookie_json is not None:
+        try:
+            parsed = json.loads(cookie_json)
+        except json.JSONDecodeError as e:
+            return f"Invalid JSON: {e}. Cookies file left untouched."
+        COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write: tmp file + rename
+        fd, tmp = tempfile.mkstemp(
+            dir=str(COOKIES_PATH.parent), suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(parsed, f, indent=2)
+            os.replace(tmp, str(COOKIES_PATH))
+        except Exception as e:
+            os.unlink(tmp)
+            return f"Failed to write cookies: {e}"
+        return (
+            f"Cookies written to {COOKIES_PATH} from pasted JSON. "
+            f"On a deployment machine, copy this file there and set X_MCP_COOKIES_PATH to its path."
+        )
+
+    # Strategy 2: copy local file
+    if cookie_file is not None:
+        src = Path(cookie_file)
+        if not src.exists():
+            return f"Source file not found: {cookie_file}"
+        try:
+            parsed = json.loads(src.read_text())
+        except json.JSONDecodeError as e:
+            return f"Source file is not valid JSON: {e}"
+        COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(COOKIES_PATH.parent), suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(parsed, f, indent=2)
+            os.replace(tmp, str(COOKIES_PATH))
+        except Exception as e:
+            os.unlink(tmp)
+            return f"Failed to write cookies: {e}"
+        return (
+            f"Cookies copied from {cookie_file} to {COOKIES_PATH}. "
+            f"On a deployment machine, copy {COOKIES_PATH} there and set X_MCP_COOKIES_PATH accordingly."
+        )
+
+    # Strategy 3: auto-login
+    if not USERNAME or not PASSWORD:
+        return (
+            "No cookies file found and missing TWITTER_USERNAME/TWITTER_PASSWORD. "
+            "To set up cookies, do one of:\n"
+            "  1. Set X_MCP_PROXY to a residential proxy URL (http:// or socks5://) "
+            "and TWITTER_USERNAME/TWITTER_EMAIL/TWITTER_PASSWORD, then call get_cookie() with no args (auto-login).\n"
+            "  2. Pass cookie_json=<JSON string> if you've exported cookies from a browser.\n"
+            "  3. Pass cookie_file=<local file path> if you have cookies saved on this machine."
+        )
+    if not PROXY_URL:
+        logger.warning(
+            "X_MCP_PROXY not set. Auto-login will go direct. If you're on a "
+            "datacenter IP, Cloudflare will likely block the login (403)."
+        )
+    try:
+        client = await get_twitter_client()
+    except Exception as e:
+        return f"Auto-login failed: {e}\nIf you got a 403/Cloudflare block, set X_MCP_PROXY to a residential proxy and retry."
+    return (
+        f"Cookies saved to {COOKIES_PATH} via auto-login"
+        f"{' via proxy ' + PROXY_URL if PROXY_URL else ' (direct)'}.\n"
+        f"On a deployment machine, copy this file there and set X_MCP_COOKIES_PATH to its path. "
+        f"No proxy needed on the deployment side."
+    )
 
 
 @mcp.tool()

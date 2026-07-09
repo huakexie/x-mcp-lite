@@ -79,15 +79,54 @@ Three pieces, all in `src/x_mcp/throttle.py`:
    }
    ```
 
-   Optional env vars:
+   Optional env vars (see `.env.example` for full list):
+   - `X_MCP_COOKIES_PATH` — path to cookies file (defaults to `~/.x-mcp/cookies.json`)
+   - `X_MCP_PROXY` — residential proxy URL for auto-login only (see Cookie setup below)
    - `USER_AGENT` — custom user agent
    - `CAPSOLVER_API_KEY` — for CAPTCHA solving (only needed if you hit Arkose challenges)
 
 3. The MCP server starts automatically when your MCP host launches.
 
-## Cookie handling
+## Cookie setup (recommended for server deployment)
 
-On first run, the server logs in with username/email/password and saves cookies to `~/.x-mcp/cookies.json`. Subsequent runs load cookies directly. If cookies expire (e.g., Twitter requires re-verification), the login will fail with an error — delete the cookie file and re-run to re-login. **Do not** retry login automatically; repeated login attempts raise account-lock risk.
+Twitter's Cloudflare blocks login requests from datacenter IPs with HTTP 403. If you deploy to a server (VPS, container), you should obtain cookies **once** from a residential-IP machine and reuse them — no proxy needed on the server after that.
+
+Use the `get_cookie` MCP tool. It picks one of three strategies based on what you pass:
+
+### Strategy 1: Auto-login on a residential-IP machine
+
+Best when you don't already have cookies exported. On a machine with residential IP (e.g. your laptop, optionally behind a VPN/proxy):
+
+1. Set `X_MCP_PROXY=http://user:pass@residential-proxy:port` (or `socks5://...`)
+2. Set `TWITTER_USERNAME` / `TWITTER_EMAIL` / `TWITTER_PASSWORD`
+3. Call `get_cookie()` with no args
+
+twikit logs in via the proxy, saves cookies to `X_MCP_COOKIES_PATH` (defaults to `~/.x-mcp/cookies.json`).
+
+### Strategy 2: Paste cookies from a browser
+
+Best when you've already logged into x.com in a browser and want to reuse that session.
+
+1. Use a browser extension (e.g. EditThisCookie) on x.com while logged in, export as JSON
+2. Call `get_cookie(cookie_json="<the JSON string>")`
+
+Writes the JSON directly to `X_MCP_COOKIES_PATH`. No login, no proxy, no credentials needed.
+
+### Strategy 3: Copy a local cookie file
+
+Best when cookies are already saved somewhere on this machine (e.g. from a previous setup).
+
+1. Call `get_cookie(cookie_file="/path/to/cookies.json")`
+
+Copies the file to `X_MCP_COOKIES_PATH`. No login, no proxy needed.
+
+### After cookies are saved
+
+Copy the file to your deployment machine and set `X_MCP_COOKIES_PATH` there to its absolute path. **Do not** set `X_MCP_PROXY` on the deployment machine — cookies are reused without proxy. If cookies later expire (e.g. Twitter requires re-verification), the API call will fail with `AccountLocked` or `Unauthorized`; just re-run `get_cookie` on the residential-IP machine to refresh.
+
+## Cookie handling (defaults)
+
+If you skip the `get_cookie` flow entirely, the server will attempt auto-login on first run with `TWITTER_USERNAME`/`TWITTER_PASSWORD` and save cookies to `~/.x-mcp/cookies.json`. This works on residential IPs but will fail with 403 on datacenter IPs — use the `get_cookie` flow above for server deployments.
 
 ## License
 
