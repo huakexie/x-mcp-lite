@@ -17,7 +17,13 @@ import random
 import time
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
-from twikit.errors import AccountLocked, AccountSuspended, TooManyRequests
+from twikit.errors import (
+    AccountLocked,
+    AccountSuspended,
+    Forbidden,
+    TooManyRequests,
+    Unauthorized,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,30 @@ _throttler: Optional["Throttler"] = None
 _rate_limit_resets: dict[str, float] = {}
 
 T = TypeVar("T")
+
+# Cookie setup guidance shown when auth fails. Shared between with_rate_limit
+# (which raises RuntimeError carrying this) and get_cookie (which returns it).
+COOKIE_GUIDE = """\
+To set up cookies, choose one of these two paths:
+
+PATH A: Get cookies on a residential-IP machine (e.g. your laptop), then deploy
+  1. On a machine with residential IP (optionally behind a VPN/proxy):
+     - Set X_MCP_PROXY to a residential proxy URL (http:// or socks5://)
+       if you have one; otherwise direct connection works if the machine
+       is already on a residential IP.
+     - Set TWITTER_USERNAME / TWITTER_EMAIL / TWITTER_PASSWORD
+     - Call get_cookie() with no args
+  2. Copy the saved file (default ~/.x-mcp/cookies.json) to this machine
+  3. Set X_MCP_COOKIES_PATH to its absolute path here
+  No proxy needed on this machine after that.
+
+PATH B: Provide a proxy here, let this machine auto-login
+  1. Set X_MCP_PROXY to a residential proxy URL
+     (e.g. http://user:pass@residential-proxy:8080 or socks5://...)
+  2. Set TWITTER_USERNAME / TWITTER_EMAIL / TWITTER_PASSWORD
+  3. Call get_cookie() with no args
+  Cookies will be saved to X_MCP_COOKIES_PATH here.
+"""
 
 
 def get_throttler(min_interval: float = 2.0, max_interval: float = 5.0) -> "Throttler":
@@ -88,9 +118,26 @@ async def with_rate_limit(
         await asyncio.sleep(wait_s)
         return await with_rate_limit(endpoint, fn, max_retries=max_retries - 1)
     except AccountLocked as e:
-        raise RuntimeError(f"账号被锁定，需要人工验证 (Arkose challenge): {e}")
+        raise RuntimeError(
+            f"Account locked, requires manual verification (Arkose challenge): {e}\n\n"
+            f"Run get_cookie() to refresh cookies after verifying the account.\n\n"
+            f"{COOKIE_GUIDE}"
+        )
     except AccountSuspended as e:
-        raise RuntimeError(f"账号被封禁: {e}")
+        raise RuntimeError(f"Account suspended: {e}")
+    except Unauthorized as e:
+        raise RuntimeError(
+            f"Unauthorized (401): {e}\n\n"
+            f"Cookies are missing or expired. Run get_cookie() to set up cookies.\n\n"
+            f"{COOKIE_GUIDE}"
+        )
+    except Forbidden as e:
+        raise RuntimeError(
+            f"Forbidden (403): {e}\n\n"
+            f"This usually means cookies are missing/expired OR this machine is on "
+            f"a datacenter IP. Run get_cookie() to set up cookies.\n\n"
+            f"{COOKIE_GUIDE}"
+        )
 
 
 async def paginate_all(

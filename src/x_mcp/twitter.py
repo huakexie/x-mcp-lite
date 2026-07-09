@@ -12,7 +12,7 @@ import logging
 import time
 import json
 
-from .throttle import get_throttler, with_rate_limit, paginate_all
+from .throttle import get_throttler, with_rate_limit, paginate_all, COOKIE_GUIDE
 
 # Create an MCP server with proper metadata
 mcp = FastMCP()
@@ -133,24 +133,40 @@ async def get_cookie(
     """
     import tempfile
 
-    # Strategy 1: paste JSON
-    if cookie_json is not None:
-        try:
-            parsed = json.loads(cookie_json)
-        except json.JSONDecodeError as e:
-            return f"Invalid JSON: {e}. Cookies file left untouched."
+    def _write_json_atomic(parsed: Any) -> Optional[str]:
+        """Write parsed JSON to COOKIES_PATH atomically. Returns error str or None."""
         COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write: tmp file + rename
-        fd, tmp = tempfile.mkstemp(
-            dir=str(COOKIES_PATH.parent), suffix=".tmp"
-        )
+        fd, tmp = tempfile.mkstemp(dir=str(COOKIES_PATH.parent), suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(parsed, f, indent=2)
             os.replace(tmp, str(COOKIES_PATH))
         except Exception as e:
-            os.unlink(tmp)
-            return f"Failed to write cookies: {e}"
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return f"[ERROR] Failed to write cookies: {e}"
+        return None
+
+    def _validate_cookie_dict(parsed: Any) -> Optional[str]:
+        """Validate parsed JSON is a non-empty dict. Returns error str or None."""
+        if not isinstance(parsed, dict):
+            return f"[ERROR] Cookies JSON must be a JSON object (dict), got {type(parsed).__name__}."
+        if not parsed:
+            return "[ERROR] Cookies JSON is empty. Expected an object with cookie keys."
+        return None
+
+    # Strategy 1: paste JSON
+    if cookie_json is not None:
+        try:
+            parsed = json.loads(cookie_json)
+        except json.JSONDecodeError as e:
+            return f"[ERROR] Invalid JSON: {e}. Cookies file left untouched."
+        if err := _validate_cookie_dict(parsed):
+            return err
+        if err := _write_json_atomic(parsed):
+            return err
         return (
             f"Cookies written to {COOKIES_PATH} from pasted JSON. "
             f"On a deployment machine, copy this file there and set X_MCP_COOKIES_PATH to its path."
@@ -159,23 +175,29 @@ async def get_cookie(
     # Strategy 2: copy local file
     if cookie_file is not None:
         src = Path(cookie_file)
-        if not src.exists():
-            return f"Source file not found: {cookie_file}"
+        if not src.is_file():
+            return f"[ERROR] Source file not found (or not a regular file): {cookie_file}"
+        try:
+            src_resolved = src.resolve()
+        except OSError:
+            src_resolved = src
+        try:
+            target_resolved = COOKIES_PATH.resolve()
+        except OSError:
+            target_resolved = COOKIES_PATH
+        if src_resolved == target_resolved:
+            return (
+                f"[ERROR] Source path is the same as the target cookies path "
+                f"({COOKIES_PATH}). Nothing to copy."
+            )
         try:
             parsed = json.loads(src.read_text())
         except json.JSONDecodeError as e:
-            return f"Source file is not valid JSON: {e}"
-        COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(COOKIES_PATH.parent), suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(parsed, f, indent=2)
-            os.replace(tmp, str(COOKIES_PATH))
-        except Exception as e:
-            os.unlink(tmp)
-            return f"Failed to write cookies: {e}"
+            return f"[ERROR] Source file is not valid JSON: {e}"
+        if err := _validate_cookie_dict(parsed):
+            return err
+        if err := _write_json_atomic(parsed):
+            return err
         return (
             f"Cookies copied from {cookie_file} to {COOKIES_PATH}. "
             f"On a deployment machine, copy {COOKIES_PATH} there and set X_MCP_COOKIES_PATH accordingly."
@@ -184,12 +206,8 @@ async def get_cookie(
     # Strategy 3: auto-login
     if not USERNAME or not PASSWORD:
         return (
-            "No cookies file found and missing TWITTER_USERNAME/TWITTER_PASSWORD. "
-            "To set up cookies, do one of:\n"
-            "  1. Set X_MCP_PROXY to a residential proxy URL (http:// or socks5://) "
-            "and TWITTER_USERNAME/TWITTER_EMAIL/TWITTER_PASSWORD, then call get_cookie() with no args (auto-login).\n"
-            "  2. Pass cookie_json=<JSON string> if you've exported cookies from a browser.\n"
-            "  3. Pass cookie_file=<local file path> if you have cookies saved on this machine."
+            "[ERROR] No cookies file found and missing TWITTER_USERNAME/TWITTER_PASSWORD.\n\n"
+            + COOKIE_GUIDE
         )
     if not PROXY_URL:
         logger.warning(
@@ -199,7 +217,12 @@ async def get_cookie(
     try:
         client = await get_twitter_client()
     except Exception as e:
-        return f"Auto-login failed: {e}\nIf you got a 403/Cloudflare block, set X_MCP_PROXY to a residential proxy and retry."
+        return (
+            f"[ERROR] Auto-login failed: {e}\n\n"
+            "If you got a 403/Cloudflare block, set X_MCP_PROXY to a residential "
+            "proxy and retry.\n\n"
+            + COOKIE_GUIDE
+        )
     return (
         f"Cookies saved to {COOKIES_PATH} via auto-login"
         f"{' via proxy ' + PROXY_URL if PROXY_URL else ' (direct)'}.\n"
@@ -222,7 +245,7 @@ async def search_user(
         return str(users)  # Assuming you want to return the raw result for now
     except Exception as e:
         logger.error(f"Failed to search users: {e}")
-        return f"Failed to search users: {e}"
+        return f"[ERROR] Failed to search users: {e}"
 
 
 @mcp.tool(
@@ -240,7 +263,7 @@ async def search_twitter(ctx: Context, query: str, product: str = "Top", count: 
         return convert_tweets_to_markdown(tweets)
     except Exception as e:
         logger.error(f"Failed to search tweets: {e}")
-        return f"Failed to search tweets: {e}"
+        return f"[ERROR] Failed to search tweets: {e}"
 
 
 @mcp.tool(
@@ -264,7 +287,7 @@ async def get_user_tweets(
         return convert_tweets_to_markdown(tweets)
     except Exception as e:
         logger.error(f"Failed to get user tweets: {e}")
-        return f"Failed to get user tweets: {e}"
+        return f"[ERROR] Failed to get user tweets: {e}"
 
 
 @mcp.tool(
@@ -287,7 +310,7 @@ async def get_timeline(
         return convert_tweets_to_markdown(tweets)
     except Exception as e:
         logger.error(f"Failed to get timeline: {e}")
-        return f"Failed to get timeline: {e}"
+        return f"[ERROR] Failed to get timeline: {e}"
 
 
 @mcp.tool(
@@ -310,7 +333,7 @@ async def get_latest_timeline(
         return convert_tweets_to_markdown(tweets)
     except Exception as e:
         logger.error(f"Failed to get latest timeline: {e}")
-        return f"Failed to get latest timeline: {e}"
+        return f"[ERROR] Failed to get latest timeline: {e}"
 
 
 # @mcp.tool()
@@ -347,7 +370,7 @@ async def post_tweet(
         return f"Successfully posted tweet: {tweet.id}"
     except Exception as e:
         logger.error(f"Failed to post tweet: {e}")
-        return f"Failed to post tweet: {e}"
+        return f"[ERROR] Failed to post tweet: {e}"
 
 
 # @mcp.tool()
@@ -359,7 +382,7 @@ async def delete_tweet(tweet_id: str) -> str:
         return f"Successfully deleted tweet {tweet_id}"
     except Exception as e:
         logger.error(f"Failed to delete tweet: {e}")
-        return f"Failed to delete tweet: {e}"
+        return f"[ERROR] Failed to delete tweet: {e}"
 
 
 # @mcp.tool()
@@ -380,7 +403,7 @@ async def send_dm(user_id: str, message: str, media_path: Optional[str] = None) 
         return f"Successfully sent DM to user {user_id}"
     except Exception as e:
         logger.error(f"Failed to send DM: {e}")
-        return f"Failed to send DM: {e}"
+        return f"[ERROR] Failed to send DM: {e}"
 
 
 # @mcp.tool()
@@ -392,7 +415,7 @@ async def delete_dm(message_id: str) -> str:
         return f"Successfully deleted DM {message_id}"
     except Exception as e:
         logger.error(f"Failed to delete DM: {e}")
-        return f"Failed to delete DM: {e}"
+        return f"[ERROR] Failed to delete DM: {e}"
 
 
 # @mcp.tool()
@@ -404,7 +427,7 @@ async def logout() -> str:
         return "Successfully logged out"
     except Exception as e:
         logger.error(f"Failed to logout: {e}")
-        return f"Failed to logout: {e}"
+        return f"[ERROR] Failed to logout: {e}"
 
 
 # @mcp.tool()
@@ -416,7 +439,7 @@ async def unlock() -> str:
         return "Successfully unlocked account"
     except Exception as e:
         logger.error(f"Failed to unlock account: {e}")
-        return f"Failed to unlock account: {e}"
+        return f"[ERROR] Failed to unlock account: {e}"
 
 
 # @mcp.tool()
@@ -428,7 +451,7 @@ async def get_cookies() -> str:
         return str(cookies)
     except Exception as e:
         logger.error(f"Failed to get cookies: {e}")
-        return f"Failed to get cookies: {e}"
+        return f"[ERROR] Failed to get cookies: {e}"
 
 
 # @mcp.tool()
@@ -440,7 +463,7 @@ async def save_cookies(path: str) -> str:
         return f"Successfully saved cookies to {path}"
     except Exception as e:
         logger.error(f"Failed to save cookies: {e}")
-        return f"Failed to save cookies: {e}"
+        return f"[ERROR] Failed to save cookies: {e}"
 
 
 # @mcp.tool()
@@ -456,7 +479,7 @@ async def set_cookies(
         return "Successfully set cookies"
     except Exception as e:
         logger.error(f"Failed to set cookies: {e}")
-        return f"Failed to set cookies: {e}"
+        return f"[ERROR] Failed to set cookies: {e}"
 
 
 # @mcp.tool()
@@ -468,7 +491,7 @@ async def load_cookies(path: str) -> str:
         return f"Successfully loaded cookies from {path}"
     except Exception as e:
         logger.error(f"Failed to load cookies: {e}")
-        return f"Failed to load cookies: {e}"
+        return f"[ERROR] Failed to load cookies: {e}"
 
 
 # @mcp.tool()
@@ -480,7 +503,7 @@ async def set_delegate_account(user_id: str) -> str:
         return f"Successfully set delegate account to {user_id}"
     except Exception as e:
         logger.error(f"Failed to set delegate account: {e}")
-        return f"Failed to set delegate account: {e}"
+        return f"[ERROR] Failed to set delegate account: {e}"
 
 
 @mcp.tool()
@@ -493,7 +516,7 @@ async def get_user_id() -> str:
         return user_id
     except Exception as e:
         logger.error(f"Failed to get user ID: {e}")
-        return f"Failed to get user ID: {e}"
+        return f"[ERROR] Failed to get user ID: {e}"
 
 
 @mcp.tool()
@@ -506,7 +529,7 @@ async def get_user() -> str:
         return str(user)
     except Exception as e:
         logger.error(f"Failed to get user: {e}")
-        return f"Failed to get user: {e}"
+        return f"[ERROR] Failed to get user: {e}"
 
 
 @mcp.tool()
@@ -521,7 +544,7 @@ async def get_similar_tweets(tweet_id: str) -> str:
         return convert_tweets_to_markdown(tweets)
     except Exception as e:
         logger.error(f"Failed to get similar tweets: {e}")
-        return f"Failed to get similar tweets: {e}"
+        return f"[ERROR] Failed to get similar tweets: {e}"
 
 
 # @mcp.tool()
@@ -537,7 +560,7 @@ async def create_media_metadata(
         return f"Successfully created media metadata for {media_id}"
     except Exception as e:
         logger.error(f"Failed to create media metadata: {e}")
-        return f"Failed to create media metadata: {e}"
+        return f"[ERROR] Failed to create media metadata: {e}"
 
 
 # @mcp.tool(
@@ -558,7 +581,7 @@ async def create_poll_tweet(ctx: Context, text: str, choices: List[str], duratio
         return f"Successfully created poll tweet: https://twitter.com/i/status/{tweet.id}"
     except Exception as e:
         logger.error(f"Failed to create poll tweet: {e}")
-        return f"Failed to create poll tweet: {e}"
+        return f"[ERROR] Failed to create poll tweet: {e}"
 
 
 # @mcp.tool()
@@ -575,7 +598,7 @@ async def vote(
         return f"Successfully voted on poll: {poll.id}"
     except Exception as e:
         logger.error(f"Failed to vote on poll: {e}")
-        return f"Failed to vote on poll: {e}"
+        return f"[ERROR] Failed to vote on poll: {e}"
 
 
 # @mcp.tool()
@@ -596,7 +619,7 @@ async def create_scheduled_tweet(
         return f"Successfully scheduled tweet with ID: {tweet_id}"
     except Exception as e:
         logger.error(f"Failed to schedule tweet: {e}")
-        return f"Failed to schedule tweet: {e}"
+        return f"[ERROR] Failed to schedule tweet: {e}"
 
 
 @mcp.tool()
@@ -611,7 +634,7 @@ async def get_user_by_screen_name(screen_name: str) -> str:
         return str(user)
     except Exception as e:
         logger.error(f"Failed to get user by screen name: {e}")
-        return f"Failed to get user by screen name: {e}"
+        return f"[ERROR] Failed to get user by screen name: {e}"
 
 
 @mcp.tool()
@@ -626,7 +649,7 @@ async def get_user_by_id(user_id: str) -> str:
         return str(user)
     except Exception as e:
         logger.error(f"Failed to get user by ID: {e}")
-        return f"Failed to get user by ID: {e}"
+        return f"[ERROR] Failed to get user by ID: {e}"
 
 
 # @mcp.tool()
@@ -646,7 +669,7 @@ async def reverse_geocode(
         return str(places)
     except Exception as e:
         logger.error(f"Failed to reverse geocode: {e}")
-        return f"Failed to reverse geocode: {e}"
+        return f"[ERROR] Failed to reverse geocode: {e}"
 
 
 # @mcp.tool()
@@ -665,7 +688,7 @@ async def search_geo(
         return str(places)
     except Exception as e:
         logger.error(f"Failed to search geo: {e}")
-        return f"Failed to search geo: {e}"
+        return f"[ERROR] Failed to search geo: {e}"
 
 
 # @mcp.tool()
@@ -677,7 +700,7 @@ async def get_place(place_id: str) -> str:
         return str(place)
     except Exception as e:
         logger.error(f"Failed to get place: {e}")
-        return f"Failed to get place: {e}"
+        return f"[ERROR] Failed to get place: {e}"
 
 
 @mcp.tool()
@@ -694,7 +717,7 @@ async def get_tweet_by_id(
         return str(tweet)
     except Exception as e:
         logger.error(f"Failed to get tweet by ID: {e}")
-        return f"Failed to get tweet by ID: {e}"
+        return f"[ERROR] Failed to get tweet by ID: {e}"
 
 
 @mcp.tool()
@@ -709,7 +732,7 @@ async def get_scheduled_tweets() -> str:
         return str(tweets)
     except Exception as e:
         logger.error(f"Failed to get scheduled tweets: {e}")
-        return f"Failed to get scheduled tweets: {e}"
+        return f"[ERROR] Failed to get scheduled tweets: {e}"
 
 
 # @mcp.tool()
@@ -721,7 +744,7 @@ async def delete_scheduled_tweet(tweet_id: str) -> str:
         return f"Successfully deleted scheduled tweet {tweet_id}"
     except Exception as e:
         logger.error(f"Failed to delete scheduled tweet: {e}")
-        return f"Failed to delete scheduled tweet: {e}"
+        return f"[ERROR] Failed to delete scheduled tweet: {e}"
 
 
 @mcp.tool()
@@ -738,7 +761,7 @@ async def get_retweeters(
         return convert_tweets_to_markdown(retweeters)
     except Exception as e:
         logger.error(f"Failed to get retweeters: {e}")
-        return f"Failed to get retweeters: {e}"
+        return f"[ERROR] Failed to get retweeters: {e}"
 
 
 @mcp.tool()
@@ -755,7 +778,7 @@ async def get_favoriters(
         return convert_tweets_to_markdown(favoriters)
     except Exception as e:
         logger.error(f"Failed to get favoriters: {e}")
-        return f"Failed to get favoriters: {e}"
+        return f"[ERROR] Failed to get favoriters: {e}"
 
 
 @mcp.tool()
@@ -770,7 +793,7 @@ async def get_community_note(note_id: str) -> str:
         return str(note)
     except Exception as e:
         logger.error(f"Failed to get community note: {e}")
-        return f"Failed to get community note: {e}"
+        return f"[ERROR] Failed to get community note: {e}"
 
 
 @mcp.tool()
@@ -785,7 +808,7 @@ async def favorite_tweet(tweet_id: str) -> str:
         return f"Successfully favorited tweet {tweet_id}"
     except Exception as e:
         logger.error(f"Failed to favorite tweet: {e}")
-        return f"Failed to favorite tweet: {e}"
+        return f"[ERROR] Failed to favorite tweet: {e}"
 
 
 @mcp.tool()
@@ -800,7 +823,7 @@ async def unfavorite_tweet(tweet_id: str) -> str:
         return f"Successfully unfavorited tweet {tweet_id}"
     except Exception as e:
         logger.error(f"Failed to unfavorite tweet: {e}")
-        return f"Failed to unfavorite tweet: {e}"
+        return f"[ERROR] Failed to unfavorite tweet: {e}"
 
 
 # @mcp.tool()
@@ -812,7 +835,7 @@ async def retweet(tweet_id: str) -> str:
         return f"Successfully retweeted tweet {tweet_id}"
     except Exception as e:
         logger.error(f"Failed to retweet: {e}")
-        return f"Failed to retweet: {e}"
+        return f"[ERROR] Failed to retweet: {e}"
 
 
 # @mcp.tool()
@@ -824,7 +847,7 @@ async def delete_retweet(tweet_id: str) -> str:
         return f"Successfully deleted retweet of tweet {tweet_id}"
     except Exception as e:
         logger.error(f"Failed to delete retweet: {e}")
-        return f"Failed to delete retweet: {e}"
+        return f"[ERROR] Failed to delete retweet: {e}"
 
 
 @mcp.tool()
@@ -841,7 +864,7 @@ async def bookmark_tweet(
         return f"Successfully bookmarked tweet {tweet_id}"
     except Exception as e:
         logger.error(f"Failed to bookmark tweet: {e}")
-        return f"Failed to bookmark tweet: {e}"
+        return f"[ERROR] Failed to bookmark tweet: {e}"
 
 
 @mcp.tool()
@@ -856,7 +879,7 @@ async def delete_bookmark(tweet_id: str) -> str:
         return f"Successfully deleted bookmark for tweet {tweet_id}"
     except Exception as e:
         logger.error(f"Failed to delete bookmark: {e}")
-        return f"Failed to delete bookmark: {e}"
+        return f"[ERROR] Failed to delete bookmark: {e}"
 
 
 @mcp.tool()
@@ -875,7 +898,7 @@ async def get_bookmarks(
         return convert_tweets_to_markdown(bookmarks)
     except Exception as e:
         logger.error(f"Failed to get bookmarks: {e}")
-        return f"Failed to get bookmarks: {e}"
+        return f"[ERROR] Failed to get bookmarks: {e}"
 
 
 @mcp.tool()
@@ -901,7 +924,7 @@ async def get_all_bookmarks(
         return convert_tweets_to_markdown(all_tweets)
     except Exception as e:
         logger.error(f"Failed to get all bookmarks: {e}")
-        return f"Failed to get all bookmarks: {e}"
+        return f"[ERROR] Failed to get all bookmarks: {e}"
 
 
 # @mcp.tool()
@@ -913,7 +936,7 @@ async def delete_all_bookmarks() -> str:
         return "Successfully deleted all bookmarks"
     except Exception as e:
         logger.error(f"Failed to delete all bookmarks: {e}")
-        return f"Failed to delete all bookmarks: {e}"
+        return f"[ERROR] Failed to delete all bookmarks: {e}"
 
 
 @mcp.tool()
@@ -928,7 +951,7 @@ async def get_bookmark_folders(cursor: Optional[str] = None) -> str:
         return str(folders)
     except Exception as e:
         logger.error(f"Failed to get bookmark folders: {e}")
-        return f"Failed to get bookmark folders: {e}"
+        return f"[ERROR] Failed to get bookmark folders: {e}"
 
 
 # @mcp.tool()
@@ -941,7 +964,7 @@ async def edit_bookmark_folder(folder_id: str, name: str) -> str:
     except Exception as e:
         logger.error(f"Failed to edit bookmark folder: {e}")
         logger.error(f"Failed to delete bookmark folder: {e}")
-        return f"Failed to delete bookmark folder: {e}"
+        return f"[ERROR] Failed to delete bookmark folder: {e}"
 
 
 # @mcp.tool()
@@ -953,7 +976,7 @@ async def create_bookmark_folder(name: str) -> str:
         return f"Successfully created bookmark folder {folder.id}"
     except Exception as e:
         logger.error(f"Failed to create bookmark folder: {e}")
-        return f"Failed to create bookmark folder: {e}"
+        return f"[ERROR] Failed to create bookmark folder: {e}"
 
 
 # @mcp.tool()
@@ -965,7 +988,7 @@ async def follow_user(user_id: str) -> str:
         return f"Successfully followed user {user.id}"
     except Exception as e:
         logger.error(f"Failed to follow user: {e}")
-        return f"Failed to follow user: {e}"
+        return f"[ERROR] Failed to follow user: {e}"
 
 
 # @mcp.tool()
@@ -977,7 +1000,7 @@ async def unfollow_user(user_id: str) -> str:
         return f"Successfully unfollowed user {user.id}"
     except Exception as e:
         logger.error(f"Failed to unfollow user: {e}")
-        return f"Failed to unfollow user: {e}"
+        return f"[ERROR] Failed to unfollow user: {e}"
 
 
 # @mcp.tool()
@@ -989,7 +1012,7 @@ async def block_user(user_id: str) -> str:
         return f"Successfully blocked user {user.id}"
     except Exception as e:
         logger.error(f"Failed to block user: {e}")
-        return f"Failed to block user: {e}"
+        return f"[ERROR] Failed to block user: {e}"
 
 
 # @mcp.tool()
@@ -1001,7 +1024,7 @@ async def unblock_user(user_id: str) -> str:
         return f"Successfully unblocked user {user.id}"
     except Exception as e:
         logger.error(f"Failed to unblock user: {e}")
-        return f"Failed to unblock user: {e}"
+        return f"[ERROR] Failed to unblock user: {e}"
 
 
 # @mcp.tool()
@@ -1013,7 +1036,7 @@ async def mute_user(user_id: str) -> str:
         return f"Successfully muted user {user.id}"
     except Exception as e:
         logger.error(f"Failed to mute user: {e}")
-        return f"Failed to mute user: {e}"
+        return f"[ERROR] Failed to mute user: {e}"
 
 
 @mcp.tool(
@@ -1041,7 +1064,7 @@ async def get_trends(
         } for trend in trends], indent=2)
     except Exception as e:
         logger.error(f"Failed to get trends: {e}")
-        return f"Failed to get trends: {e}"
+        return f"[ERROR] Failed to get trends: {e}"
 
 
 @mcp.tool()
@@ -1058,7 +1081,7 @@ async def get_user_followers(
         return convert_tweets_to_markdown(followers)
     except Exception as e:
         logger.error(f"Failed to get user followers: {e}")
-        return f"Failed to get user followers: {e}"
+        return f"[ERROR] Failed to get user followers: {e}"
 
 
 @mcp.tool()
@@ -1078,7 +1101,7 @@ async def get_latest_followers(
         return convert_tweets_to_markdown(followers)
     except Exception as e:
         logger.error(f"Failed to get latest followers: {e}")
-        return f"Failed to get latest followers: {e}"
+        return f"[ERROR] Failed to get latest followers: {e}"
 
 
 @mcp.tool()
@@ -1098,7 +1121,7 @@ async def get_latest_friends(
         return convert_tweets_to_markdown(friends)
     except Exception as e:
         logger.error(f"Failed to get latest friends: {e}")
-        return f"Failed to get latest friends: {e}"
+        return f"[ERROR] Failed to get latest friends: {e}"
 
 
 @mcp.tool()
@@ -1115,7 +1138,7 @@ async def get_user_verified_followers(
         return convert_tweets_to_markdown(followers)
     except Exception as e:
         logger.error(f"Failed to get user verified followers: {e}")
-        return f"Failed to get user verified followers: {e}"
+        return f"[ERROR] Failed to get user verified followers: {e}"
 
 
 @mcp.tool()
@@ -1132,7 +1155,7 @@ async def get_user_followers_you_know(
         return convert_tweets_to_markdown(followers)
     except Exception as e:
         logger.error(f"Failed to get user followers you might know: {e}")
-        return f"Failed to get user followers you might know: {e}"
+        return f"[ERROR] Failed to get user followers you might know: {e}"
 
 
 @mcp.tool()
@@ -1149,7 +1172,7 @@ async def get_user_following(
         return convert_tweets_to_markdown(following)
     except Exception as e:
         logger.error(f"Failed to get user following: {e}")
-        return f"Failed to get user following: {e}"
+        return f"[ERROR] Failed to get user following: {e}"
 
 
 @mcp.tool()
@@ -1166,7 +1189,7 @@ async def get_user_subscriptions(
         return convert_tweets_to_markdown(subscriptions)
     except Exception as e:
         logger.error(f"Failed to get user subscriptions: {e}")
-        return f"Failed to get user subscriptions: {e}"
+        return f"[ERROR] Failed to get user subscriptions: {e}"
 
 
 @mcp.tool()
@@ -1186,7 +1209,7 @@ async def get_followers_ids(
         return str(ids)
     except Exception as e:
         logger.error(f"Failed to get followers ids: {e}")
-        return f"Failed to get followers ids: {e}"
+        return f"[ERROR] Failed to get followers ids: {e}"
 
 
 @mcp.tool()
@@ -1206,7 +1229,7 @@ async def get_friends_ids(
         return str(ids)
     except Exception as e:
         logger.error(f"Failed to get friends ids: {e}")
-        return f"Failed to get friends ids: {e}"
+        return f"[ERROR] Failed to get friends ids: {e}"
 
 
 # @mcp.tool()
@@ -1218,7 +1241,7 @@ async def unmute_user(user_id: str) -> str:
         return f"Successfully unmuted user {user.id}"
     except Exception as e:
         logger.error(f"Failed to unmute user: {e}")
-        return f"Failed to unmute user: {e}"
+        return f"[ERROR] Failed to unmute user: {e}"
 
 
 @mcp.tool()
@@ -1235,7 +1258,7 @@ async def get_highlights_tweets(
         return convert_tweets_to_markdown(tweets)
     except Exception as e:
         logger.error(f"Failed to get user highlights tweets: {e}")
-        return f"Failed to get user highlights tweets: {e}"
+        return f"[ERROR] Failed to get user highlights tweets: {e}"
 
 
 # @mcp.tool()
@@ -1248,7 +1271,7 @@ async def update_user() -> str:
         return f"Successfully updated user {user.id}"
     except Exception as e:
         logger.error(f"Failed to update user: {e}")
-        return f"Failed to update user: {e}"
+        return f"[ERROR] Failed to update user: {e}"
 
 
 # @mcp.tool()
@@ -1262,7 +1285,7 @@ async def add_reaction_to_message(
         return f"Successfully added reaction to message {message_id}"
     except Exception as e:
         logger.error(f"Failed to add reaction to message: {e}")
-        return f"Failed to add reaction to message: {e}"
+        return f"[ERROR] Failed to add reaction to message: {e}"
 
 
 # @mcp.tool()
@@ -1276,7 +1299,7 @@ async def remove_reaction_from_message(
         return f"Successfully removed reaction from message {message_id}"
     except Exception as e:
         logger.error(f"Failed to remove reaction from message: {e}")
-        return f"Failed to remove reaction from message: {e}"
+        return f"[ERROR] Failed to remove reaction from message: {e}"
 
 
 @mcp.tool()
@@ -1293,7 +1316,7 @@ async def get_dm_history(
         return str(messages)
     except Exception as e:
         logger.error(f"Failed to get DM history: {e}")
-        return f"Failed to get DM history: {e}"
+        return f"[ERROR] Failed to get DM history: {e}"
 
 
 # @mcp.tool()
@@ -1310,7 +1333,7 @@ async def send_dm_to_group(
         return f"Successfully sent DM to group {group_id}: {message.id}"
     except Exception as e:
         logger.error(f"Failed to send DM to group: {e}")
-        return f"Failed to send DM to group: {e}"
+        return f"[ERROR] Failed to send DM to group: {e}"
 
 
 # @mcp.tool()
@@ -1324,7 +1347,7 @@ async def get_group_dm_history(
         return str(messages)
     except Exception as e:
         logger.error(f"Failed to get group DM history: {e}")
-        return f"Failed to get group DM history: {e}"
+        return f"[ERROR] Failed to get group DM history: {e}"
 
 
 # @mcp.tool()
@@ -1336,7 +1359,7 @@ async def get_group(group_id: str) -> str:
         return str(group)
     except Exception as e:
         logger.error(f"Failed to get group: {e}")
-        return f"Failed to get group: {e}"
+        return f"[ERROR] Failed to get group: {e}"
 
 
 # @mcp.tool()
@@ -1350,7 +1373,7 @@ async def add_members_to_group(
         return f"Successfully added members to group {group_id}"
     except Exception as e:
         logger.error(f"Failed to add members to group: {e}")
-        return f"Failed to add members to group: {e}"
+        return f"[ERROR] Failed to add members to group: {e}"
 
 
 # @mcp.tool()
@@ -1362,7 +1385,7 @@ async def change_group_name(group_id: str, name: str) -> str:
         return f"Successfully changed group name for group {group_id}"
     except Exception as e:
         logger.error(f"Failed to change group name: {e}")
-        return f"Failed to change group name: {e}"
+        return f"[ERROR] Failed to change group name: {e}"
 
 
 @mcp.tool(
@@ -1395,7 +1418,7 @@ async def get_user_profile(ctx: Context, user_id: str) -> Dict[str, Any]:
         }
     except Exception as e:
         logger.error(f"Failed to get user profile: {e}")
-        return {"error": str(e)}
+        return {"error": f"[ERROR] {e}"}
 
 
 @mcp.tool()
@@ -1426,7 +1449,7 @@ async def get_tweet_details(tweet_id: str) -> Dict[str, Any]:
         logger.error(f"Failed to get tweet details: {e}")
         return {
             "success": False,
-            "error": str(e),
+            "error": f"[ERROR] {e}",
             "error_type": "TwitterAPIError"
         }
 
@@ -1449,7 +1472,7 @@ async def vote_on_poll(tweet_id: str, choice: str) -> str:
         return f"Successfully voted for '{choice}' on tweet {tweet_id}"
     except Exception as e:
         logger.error(f"Failed to vote on poll: {e}")
-        return f"Failed to vote on poll: {e}"
+        return f"[ERROR] Failed to vote on poll: {e}"
 
 
 @mcp.tool()
@@ -1467,7 +1490,7 @@ async def get_user_mentions(
         return convert_tweets_to_markdown(tweets)
     except Exception as e:
         logger.error(f"Failed to get user mentions: {e}")
-        return f"Failed to get user mentions: {e}"
+        return f"[ERROR] Failed to get user mentions: {e}"
 
 
 @mcp.tool()
@@ -1500,4 +1523,4 @@ async def get_conversation_thread(tweet_id: str) -> str:
         return convert_tweets_to_markdown(conversation)
     except Exception as e:
         logger.error(f"Failed to get conversation thread: {e}")
-        return f"Failed to get conversation thread: {e}"
+        return f"[ERROR] Failed to get conversation thread: {e}"
