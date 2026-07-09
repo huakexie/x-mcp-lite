@@ -55,12 +55,23 @@ async def get_twitter_client(proxy: Optional[str] = None) -> twikit.Client:
 
     Behavior:
     - If X_MCP_COOKIES_PATH exists: load cookies from it (no login, no proxy needed).
-    - Otherwise: login with TWITTER_USERNAME/EMAIL/PASSWORD, optionally via a proxy.
+    - Otherwise: login with TWITTER_USERNAME/PASSWORD, optionally via a proxy.
+      EMAIL is optional (X accounts don't always have one); omitted if not set.
 
     Args:
       proxy: optional proxy URL for this call. Overrides X_MCP_PROXY env var.
               Used by get_cookie() to let agents pass a proxy at runtime.
+
+    Login failures are wrapped with a cookie-setup guide so that agents
+    seeing 403/401/AccountLocked can self-serve via get_cookie(proxy=...).
     """
+    from twikit.errors import (
+        AccountLocked,
+        AccountSuspended,
+        Forbidden,
+        Unauthorized,
+    )
+
     effective_proxy = proxy if proxy is not None else PROXY_URL
     captcha_solver = None
     if CAPSOLVER_API_KEY:
@@ -77,17 +88,26 @@ async def get_twitter_client(proxy: Optional[str] = None) -> twikit.Client:
     else:
         if not USERNAME or not PASSWORD:
             raise RuntimeError(
-                "No cookies file found and missing TWITTER_USERNAME/TWITTER_PASSWORD. "
-                "Either set X_MCP_COOKIES_PATH to an existing cookies file, "
-                "or set TWITTER_USERNAME + TWITTER_PASSWORD (+ optionally X_MCP_PROXY for a residential proxy)."
+                "[ERROR] No cookies file found and missing TWITTER_USERNAME/TWITTER_PASSWORD. "
+                "Restart the MCP server with these env vars configured.\n\n"
+                + COOKIE_GUIDE
             )
         try:
-            await client.login(
-                auth_info_1=USERNAME, auth_info_2=EMAIL, password=PASSWORD
+            login_kwargs: dict = {"auth_info_1": USERNAME, "password": PASSWORD}
+            if EMAIL:
+                login_kwargs["auth_info_2"] = EMAIL
+            await client.login(**login_kwargs)
+        except (AccountLocked, AccountSuspended, Forbidden, Unauthorized) as e:
+            # Auth-related failures: wrap with cookie guide so agents can self-serve.
+            logger.error(f"Login failed ({type(e).__name__}): {e}")
+            raise RuntimeError(
+                f"[ERROR] Login failed: {type(e).__name__}: {e}\n\n"
+                + COOKIE_GUIDE
             )
         except Exception as e:
+            # Unknown failure: don't wrap, but prefix so it's clearly an error.
             logger.error(f"Failed to login: {e}")
-            raise
+            raise RuntimeError(f"[ERROR] Login failed: {type(e).__name__}: {e}")
         COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
         client.save_cookies(str(COOKIES_PATH))
 
