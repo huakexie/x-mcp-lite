@@ -88,9 +88,8 @@ async def get_twitter_client(proxy: Optional[str] = None) -> twikit.Client:
     else:
         if not USERNAME or not PASSWORD:
             raise RuntimeError(
-                "[ERROR] No cookies file found and missing TWITTER_USERNAME/TWITTER_PASSWORD. "
-                "Restart the MCP server with these env vars configured.\n\n"
-                + COOKIE_GUIDE
+                "[ERROR] Missing TWITTER_USERNAME/TWITTER_PASSWORD in MCP server env. "
+                "The user must restart the MCP server with these env vars configured."
             )
         try:
             login_kwargs: dict = {"auth_info_1": USERNAME, "password": PASSWORD}
@@ -98,10 +97,10 @@ async def get_twitter_client(proxy: Optional[str] = None) -> twikit.Client:
                 login_kwargs["auth_info_2"] = EMAIL
             await client.login(**login_kwargs)
         except (AccountLocked, AccountSuspended, Forbidden, Unauthorized) as e:
-            # Auth-related failures: wrap with cookie guide so agents can self-serve.
+            # Auth-related failures: tell the agent to call get_cookie.
             logger.error(f"Login failed ({type(e).__name__}): {e}")
             raise RuntimeError(
-                f"[ERROR] Login failed: {type(e).__name__}: {e}\n\n"
+                f"[ERROR] Login failed ({type(e).__name__}): {e}. "
                 + COOKIE_GUIDE
             )
         except Exception as e:
@@ -143,25 +142,29 @@ async def get_cookie(
     cookie_file: Optional[str] = None,
     proxy: Optional[str] = None,
 ) -> str:
-    """One-time cookie setup helper. Picks a strategy based on what you pass.
+    """Set up Twitter cookies for this MCP server. Pick one strategy by passing the corresponding argument.
 
-    Strategies (in priority order):
-    1. cookie_json=<str>: write the JSON string directly to the cookies path.
-       Use this when you've exported cookies from a browser, or received
-       cookie JSON from another machine, and want to paste it here.
-    2. cookie_file=<path>: copy a local file to the cookies path.
-       Use this when you've already saved cookies somewhere on this machine.
-    3. Otherwise: perform a fresh twikit login and save the resulting cookies.
-       Pass `proxy` to route login through a residential proxy URL
-       (e.g. http://user:pass@host:port or socks5://host:port). If `proxy`
-       is not given, falls back to X_MCP_PROXY env var, then direct connection.
+    STRATEGY 1 (recommended): proxy="<residential proxy URL>"
+      Performs an automated twikit login routed through a residential proxy.
+      Does NOT involve handling user credentials — TWITTER_USERNAME and
+      TWITTER_PASSWORD stay inside the MCP server env; you only pass a
+      network proxy address (e.g. http://user:pass@host:port or socks5://host:port).
+      Use this when the server is on a datacenter IP and login is blocked
+      by Cloudflare. Falls back to X_MCP_PROXY env var if `proxy` is None,
+      then to direct connection.
 
-    Requires TWITTER_USERNAME / TWITTER_PASSWORD env vars for strategy 3.
-    Strategies 1 and 2 don't need credentials.
+    STRATEGY 2 (only if user can't provide a proxy): cookie_json="<JSON string>"
+      Writes the given JSON directly to the cookies path. Use this when the
+      user has exported cookies from a browser (e.g. EditThisCookie on x.com)
+      or has run get_cookie() on another machine and pasted the resulting
+      JSON here. NOTE: this transfers login tokens — prefer STRATEGY 1 when
+      possible.
 
-    After this tool succeeds, the cookies file at X_MCP_COOKIES_PATH is ready.
-    On a deployment machine, just copy the file there and set X_MCP_COOKIES_PATH
-    accordingly; no proxy needed on the deployment side.
+    STRATEGY 3: cookie_file="<local file path>"
+      Copies a local file to the cookies path. Same caveat as STRATEGY 2.
+
+    If neither argument is passed: returns a short prompt asking for a
+    proxy URL (so the agent knows what to do next).
     """
     import tempfile
 
@@ -235,28 +238,28 @@ async def get_cookie(
             f"On a deployment machine, copy {COOKIES_PATH} there and set X_MCP_COOKIES_PATH accordingly."
         )
 
-    # Strategy 3: auto-login
+    # Strategy 3: auto-login (no cookie_json / cookie_file)
     if not USERNAME or not PASSWORD:
         return (
-            "[ERROR] No cookies file found and missing TWITTER_USERNAME/TWITTER_PASSWORD.\n\n"
-            + COOKIE_GUIDE
+            "[ERROR] Missing TWITTER_USERNAME / TWITTER_PASSWORD in MCP server env. "
+            "The user must restart the MCP server with these env vars configured."
+        )
+    # If proxy wasn't passed and X_MCP_PROXY isn't set, ask the user for one.
+    if proxy is None and not PROXY_URL:
+        return (
+            "Provide a residential proxy URL to route the login through. "
+            "Format: http://user:pass@host:port or socks5://host:port.\n"
+            "Pass it as the `proxy` argument: get_cookie(proxy=\"<the URL>\").\n"
+            "This is a network proxy address, not an X account credential — "
+            "TWITTER_USERNAME and TWITTER_PASSWORD stay inside the MCP server env."
         )
     effective_proxy = proxy if proxy is not None else PROXY_URL
-    if not effective_proxy:
-        logger.warning(
-            "No proxy configured (neither `proxy` arg nor X_MCP_PROXY env). "
-            "Auto-login will go direct. If you're on a datacenter IP, "
-            "Cloudflare will likely block the login (403)."
-        )
+    if proxy is None and PROXY_URL:
+        logger.info("Using X_MCP_PROXY env var as proxy (no `proxy` arg passed).")
     try:
         client = await get_twitter_client(proxy=proxy)
     except Exception as e:
-        return (
-            f"[ERROR] Auto-login failed: {e}\n\n"
-            "If you got a 403/Cloudflare block, pass a residential proxy URL "
-            "as the `proxy` argument and retry.\n\n"
-            + COOKIE_GUIDE
-        )
+        return f"[ERROR] Auto-login failed: {e}"
     return (
         f"Cookies saved to {COOKIES_PATH} via auto-login"
         f"{' via proxy ' + effective_proxy if effective_proxy else ' (direct)'}.\n"

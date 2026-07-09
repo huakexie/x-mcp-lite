@@ -32,35 +32,10 @@ _rate_limit_resets: dict[str, float] = {}
 
 T = TypeVar("T")
 
-# Cookie setup guidance shown when auth fails. Shared between with_rate_limit
-# (which raises RuntimeError carrying this) and get_cookie (which returns it).
-# Starts with a concrete next-action (the "ask user for proxy" pattern that
-# agents can execute), then lists alternative paths as an appendix.
-COOKIE_GUIDE = """\
-To fix this, the most common path is:
-
-  1. Ask the user for a residential proxy URL
-     (format: http://user:pass@host:port or socks5://host:port)
-  2. Call get_cookie(proxy="<the proxy URL>")
-  3. Retry the failed call
-
-Cookies will be saved to X_MCP_COOKIES_PATH on this machine. No proxy needed
-after that — cookies are reused for subsequent calls.
-
-Alternative paths (if the user can't provide a proxy):
-
-PATH B: Run get_cookie on another machine that's already on a residential IP
-  (e.g. the user's laptop). Read the saved cookies file (it's JSON), then
-  call get_cookie(cookie_json="<the JSON content>") here.
-
-PATH C: Paste browser-exported cookies. If the user is logged into x.com in
-  a browser, they can use an extension (e.g. EditThisCookie) to export cookies
-  as JSON, then call get_cookie(cookie_json="<the JSON string>") here.
-
-If TWITTER_USERNAME / TWITTER_PASSWORD are missing in the MCP server env:
-  The user must restart the MCP server with these env vars configured, then
-  retry. Without credentials, only PATH C works (paste cookies from elsewhere).
-"""
+# Cookie setup guidance shown when auth fails. Kept intentionally minimal:
+# just tell the agent to call get_cookie; the full path selection happens
+# inside that tool (in its docstring + no-arg return value).
+COOKIE_GUIDE = "Call get_cookie() to set up cookies. See that tool's description for options."
 
 
 def get_throttler(min_interval: float = 2.0, max_interval: float = 5.0) -> "Throttler":
@@ -125,24 +100,18 @@ async def with_rate_limit(
         return await with_rate_limit(endpoint, fn, max_retries=max_retries - 1)
     except AccountLocked as e:
         raise RuntimeError(
-            f"Account locked, requires manual verification (Arkose challenge): {e}\n\n"
-            f"Run get_cookie() to refresh cookies after verifying the account.\n\n"
-            f"{COOKIE_GUIDE}"
+            f"[ERROR] Account locked, requires manual verification (Arkose challenge): {e}. "
+            + COOKIE_GUIDE
         )
     except AccountSuspended as e:
-        raise RuntimeError(f"Account suspended: {e}")
+        raise RuntimeError(f"[ERROR] Account suspended: {e}")
     except Unauthorized as e:
         raise RuntimeError(
-            f"Unauthorized (401): {e}\n\n"
-            f"Cookies are missing or expired. Run get_cookie() to set up cookies.\n\n"
-            f"{COOKIE_GUIDE}"
+            f"[ERROR] Unauthorized (401): {e}. " + COOKIE_GUIDE
         )
     except Forbidden as e:
         raise RuntimeError(
-            f"Forbidden (403): {e}\n\n"
-            f"This usually means cookies are missing/expired OR this machine is on "
-            f"a datacenter IP. Run get_cookie() to set up cookies.\n\n"
-            f"{COOKIE_GUIDE}"
+            f"[ERROR] Forbidden (403): {e}. " + COOKIE_GUIDE
         )
 
 
