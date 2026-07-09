@@ -1,19 +1,27 @@
-"""Monkey-patch for twikit 2.3.3 ClientTransaction breakage.
+"""Monkey-patches for twikit 2.3.3 bugs that break on current x.com.
 
-As of 2026-03-18, x.com changed its homepage HTML format: the ondemand.s
-filename and its hash are now split into two separate `,<N>:"..."` entries
-instead of one inline `"ondemand.s":"<hash>"`. twikit 2.3.3's regex no longer
-matches, causing `Exception: Couldn't get KEY_BYTE indices` on every API call.
+Two independent upstream bugs, each patched at import time. This module must
+be imported BEFORE `from twikit import Client` (see twitter.py).
 
-Upstream issue: https://github.com/d60/twikit/issues/408
-Fix is upstream in https://github.com/iSarabjitDhiman/XClientTransaction
-(commit 2ff8438) but twikit has not pulled it in as of 2.3.3.
+1. ClientTransaction.get_indices — `Couldn't get KEY_BYTE indices`
+   As of 2026-03-18, x.com changed its homepage HTML format: the ondemand.s
+   filename and its hash are now split into two separate `,<N>:"..."` entries
+   instead of one inline `"ondemand.s":"<hash>"`. twikit 2.3.3's regex no
+   longer matches, causing the exception on every API call.
+   Upstream issue: https://github.com/d60/twikit/issues/408
+   Fix is upstream in https://github.com/iSarabjitDhiman/XClientTransaction
+   (commit 2ff8438) but twikit has not pulled it in as of 2.3.3. Patch below
+   is from @audioeng89, issue #408 comment 4089055868.
 
-This monkey-patch (from @audioeng89, issue #408 comment 4089055868) patches
-`ClientTransaction.get_indices` at import time. Must run BEFORE
-`from twikit import Client`.
+2. User.__init__ — `KeyError` on optional legacy.* fields
+   twikit 2.3.3 hard-indexes many optional `legacy.*` fields that x.com omits
+   for some accounts (e.g. `entities.description.urls` for accounts with no
+   bio link -> KeyError: 'urls'; `withheld_in_countries`; etc). This crashes
+   every call that parses a User object (get_user, get_bookmarks, timelines,
+   followers, ...). Same class of bug as d60/twikit PR #341 (can_media_tag).
+   Patched by wrapping the incoming data so missing keys degrade to empty.
 
-Remove this whole module once twikit ships a fixed release.
+Remove each patch once twikit ships a release that fixes the corresponding bug.
 """
 from __future__ import annotations
 
@@ -58,3 +66,47 @@ async def _patched_get_indices(self, home_page_response, session, headers):
 
 
 _tx_mod.ClientTransaction.get_indices = _patched_get_indices
+
+
+# --- User parsing: KeyError for optional legacy.* fields x.com omits ---
+#
+# twikit 2.3.3 `User.__init__` hard-indexes many optional `legacy.*` fields
+# that x.com omits for some accounts, each raising a KeyError on every call
+# that parses a User object (get_user, get_user_by_id/screen_name,
+# get_bookmarks, timelines, followers, ...). Observed in the wild:
+#   - legacy['entities']['description']['urls']  (accounts with no bio link;
+#     entities == {"description": {}})  -> KeyError: 'urls'
+#   - legacy['withheld_in_countries']            -> KeyError: 'withheld_in_countries'
+# and there are more hard-indexed optional keys where those came from. This is
+# the same class of bug as d60/twikit PR #341 (can_media_tag).
+#
+# Rather than whack-a-mole each field, we wrap the incoming `data` so that any
+# missing key at any depth degrades to an empty lenient dict instead of
+# raising. Present keys keep their real values, so normal accounts parse
+# unchanged; only the omitted optional fields end up empty.
+#
+# Remove once twikit ships a release that `.get`-guards these accesses.
+_user_mod = __import__("twikit.user", fromlist=["User"])
+_orig_user_init = _user_mod.User.__init__
+
+
+class _LenientDict(dict):
+    def __missing__(self, key):
+        return _LenientDict()
+
+
+def _lenient(obj):
+    if isinstance(obj, dict):
+        return _LenientDict((k, _lenient(v)) for k, v in obj.items())
+    if isinstance(obj, list):
+        return [_lenient(v) for v in obj]
+    return obj
+
+
+def _patched_user_init(self, client, data):
+    if isinstance(data, dict):
+        data = _lenient(data)
+    _orig_user_init(self, client, data)
+
+
+_user_mod.User.__init__ = _patched_user_init
