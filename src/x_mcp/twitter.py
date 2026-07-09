@@ -9,19 +9,12 @@ from . import twikit_patch  # noqa: F401  must run before `import twikit`
 import twikit
 import os
 from pathlib import Path
-import logging
-import time
-import json
 
 from .throttle import get_throttler, with_rate_limit, paginate_all, COOKIE_GUIDE
-from . import singbox
 
 # Create an MCP server with proper metadata
 mcp = FastMCP()
 throttler = get_throttler()
-
-# Clean up any running singbox process when the MCP server exits.
-atexit.register(singbox.stop_singbox)
 
 logger = logging.getLogger(__name__)
 httpx_logger = logging.getLogger("httpx")
@@ -35,7 +28,6 @@ CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY")
 COOKIES_PATH = Path(
     os.getenv("X_MCP_COOKIES_PATH", str(Path.home() / ".x-mcp" / "cookies.json"))
 )
-PROXY_URL = os.getenv("X_MCP_PROXY")  # None = direct connection
 
 # Rate limit tracking
 RATE_LIMITS: Dict[str, List[float]] = {}
@@ -55,24 +47,19 @@ def convert_tweets_to_markdown(tweets: Any) -> str:
         return str(tweets)
 
 
-async def get_twitter_client(proxy: Optional[str] = None) -> twikit.Client:
+async def get_twitter_client() -> twikit.Client:
     """Initialize and return an authenticated Twitter client.
 
     Behavior:
-    - If X_MCP_COOKIES_PATH exists: load cookies from it (no login, no proxy needed).
-    - Otherwise: login with TWITTER_USERNAME/PASSWORD, optionally via a proxy.
+    - If X_MCP_COOKIES_PATH exists: load cookies from it (no login needed).
+    - Otherwise: login with TWITTER_USERNAME/PASSWORD.
       EMAIL is optional (X accounts don't always have one); omitted if not set.
-
-    Args:
-      proxy: optional proxy URL for this call. Overrides X_MCP_PROXY env var.
-              Used by get_cookie() to let agents pass a proxy at runtime.
 
     Login failures are wrapped with a cookie-setup hint so that agents
     seeing 400/401/403/404/AccountLocked/etc can self-serve via get_cookie.
     """
     from twikit.errors import TwitterException
 
-    effective_proxy = proxy if proxy is not None else PROXY_URL
     captcha_solver = None
     if CAPSOLVER_API_KEY:
         captcha_solver = twikit._captcha.capsolver.Capsolver(api_key=CAPSOLVER_API_KEY)
@@ -80,7 +67,6 @@ async def get_twitter_client(proxy: Optional[str] = None) -> twikit.Client:
         "en-US",
         user_agent=USER_AGENT,
         captcha_solver=captcha_solver,
-        proxy=effective_proxy,
     )
 
     if COOKIES_PATH.exists():
@@ -141,36 +127,28 @@ def check_rate_limit(endpoint: str) -> bool:
 async def get_cookie(
     cookie_json: Optional[str] = None,
     cookie_file: Optional[str] = None,
-    proxy: Optional[str] = None,
 ) -> str:
-    """Set up Twitter cookies for this MCP server. Pick one strategy by passing the corresponding argument.
+    """Set up Twitter cookies for this MCP server. Pick one strategy.
 
-    STRATEGY 1 (recommended): proxy="<proxy URL>"
-      Performs an automated twikit login routed through a proxy. Does NOT
-      involve handling user credentials — TWITTER_USERNAME and TWITTER_PASSWORD
-      stay inside the MCP server env; you only pass a network proxy address.
-      Format: http://user:pass@host:port, https://..., socks5://host:port,
-      or socks5h://host:port. Falls back to X_MCP_PROXY env var if `proxy`
-      is None, then to direct connection.
-      Tip: residential proxies are less likely to be blocked by Cloudflare
-      than datacenter IPs, but any proxy that can reach x.com works.
+    STRATEGY 1 (recommended): cookie_json="<JSON string>"
+      Writes the given JSON directly to the cookies path. Use when you have
+      exported cookies from a browser (e.g. EditThisCookie on x.com) or from
+      another machine where auto-login succeeded.
 
-    STRATEGY 2 (only if user can't provide a proxy): cookie_json="<JSON string>"
-      Writes the given JSON directly to the cookies path. Use this when the
-      user has exported cookies from a browser (e.g. EditThisCookie on x.com)
-      or has run get_cookie() on another machine and pasted the resulting
-      JSON here. NOTE: this transfers login tokens — prefer STRATEGY 1 when
-      possible.
+    STRATEGY 2: cookie_file="<local file path>"
+      Copies a local file to the cookies path. Same caveat as STRATEGY 1.
 
-    STRATEGY 3: cookie_file="<local file path>"
-      Copies a local file to the cookies path. Same caveat as STRATEGY 2.
+    STRATEGY 3: auto-login (no arguments)
+      Logs in with TWITTER_USERNAME / TWITTER_PASSWORD from the MCP server env
+      and saves cookies. This only works reliably from a residential/uncensored
+      IP; the MCP server usually runs on a datacenter IP where Cloudflare blocks
+      login. Prefer STRATEGY 1/2 when possible.
 
-    If neither argument is passed: returns a short prompt asking for a
-    proxy URL or sing-box outbound (so the agent knows what to do next).
-
-    For non-HTTP proxy protocols (trojan/anytls/ss/etc), call set_proxy()
-    first to start a local sing-box HTTP proxy, then call get_cookie() with
-    no args — it picks up the local proxy automatically.
+    Why no proxy support? This project previously supported HTTP/SOCKS5 proxies
+    and local sing-box forwarding for trojan/vless/etc. In practice, all tested
+    datacenter/VPS IPs and proxy nodes were blocked by Cloudflare before the
+    login could complete, so proxy support was removed to keep the auth surface
+    simple. See ARCHIVE.md for the historical implementation.
     """
     import tempfile
 
@@ -250,42 +228,18 @@ async def get_cookie(
             "[ERROR] Missing TWITTER_USERNAME / TWITTER_PASSWORD in MCP server env. "
             "The user must restart the MCP server with these env vars configured."
         )
-    # Priority: explicit proxy arg > singbox active proxy (from set_proxy) >
-    # X_MCP_PROXY env var > direct connection.
-    active = singbox.get_active_proxy()
-    if proxy is not None:
-        effective_proxy = proxy
-    elif active is not None:
-        effective_proxy = active
-    elif PROXY_URL:
-        effective_proxy = PROXY_URL
-    else:
-        return (
-            "Provide a proxy URL to route the login through. "
-            "Format: http://user:pass@host:port, https://..., socks5://host:port, socks5h://host:port.\n"
-            "Pass it as the `proxy` argument: get_cookie(proxy=\"<the URL>\").\n"
-            "For non-HTTP protocols (trojan/anytls/ss/etc), call set_proxy(outbound=\"<sing-box outbound JSON>\") "
-            "first to start a local HTTP proxy, then call get_cookie() with no args.\n"
-            "This is a network proxy address, not an X account credential — "
-            "TWITTER_USERNAME and TWITTER_PASSWORD stay inside the MCP server env.\n"
-            "Tip: residential proxies are less likely to be blocked by Cloudflare than datacenter IPs."
-        )
     try:
-        client = await get_twitter_client(proxy=effective_proxy)
+        client = await get_twitter_client()
     except Exception as e:
-        return f"[ERROR] Auto-login failed: {e}"
-    # Auto-cleanup singbox if it was started by set_proxy (one-shot pattern).
-    if singbox.get_active_proxy() is not None:
-        singbox.stop_singbox()
+        return f"[ERROR] Auto-login failed: {e}\n\n{COOKIE_GUIDE}"
     return (
-        f"Cookies saved to {COOKIES_PATH} via auto-login"
-        f"{' via proxy ' + effective_proxy if effective_proxy else ' (direct)'}.\n"
+        f"Cookies saved to {COOKIES_PATH} via auto-login.\n"
         f"On a deployment machine, copy this file there and set X_MCP_COOKIES_PATH to its path. "
-        f"No proxy needed on the deployment side."
+        f"If auto-login fails on this datacenter IP, use get_cookie(cookie_json=...) instead."
     )
 
 
-@mcp.tool()
+# @mcp.tool()
 async def set_proxy(
     outbound: Optional[str] = None,
 ) -> str:
