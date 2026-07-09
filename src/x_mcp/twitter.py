@@ -302,11 +302,13 @@ async def set_proxy(
          manually).
       2. Build a full sing-box config: HTTP inbound on 127.0.0.1:<random port>
          + user's outbound + route everything through it.
-      3. Start sing-box subprocess; read actual port from stderr (10s timeout).
+      3. Start sing-box subprocess; read actual port from stderr (30s timeout,
+         configurable via `X_MCP_SINGBOX_START_TIMEOUT`).
       4. Set http://127.0.0.1:<port> as the active proxy for get_cookie().
 
-    Pass None (or call with no args) to stop sing-box, delete the downloaded
-    binary (if we managed it), and clear the active proxy.
+    Pass None (or call with no args) to stop sing-box, clear the active proxy,
+    and keep the downloaded binary cached (deleting it manually is only needed
+    if you want to force a re-download).
 
     Typical agent flow:
       1. Convert the user's node config to a sing-box outbound JSON.
@@ -317,7 +319,7 @@ async def set_proxy(
     """
     if outbound is None:
         singbox.stop_singbox()
-        return "Proxy cleared. sing-box stopped, binary deleted (if managed)."
+        return "Proxy cleared. sing-box stopped; downloaded binary remains cached in ~/.x-mcp/singbox-bin/."
     try:
         proxy_url = singbox.start_singbox(outbound)
     except Exception as e:

@@ -4,8 +4,8 @@ Used by set_proxy() to turn non-HTTP proxy protocols (trojan/anytls/ss/etc)
 into a local HTTP proxy that twikit/httpx can consume directly.
 
 Design:
-- Binary downloaded to ~/.x-mcp/singbox-bin/sing-box on first use, deleted
-  when set_proxy(None) is called or MCP server exits.
+- Binary downloaded to ~/.x-mcp/singbox-bin/sing-box on first use and kept
+  cached for reuse; set_proxy(None) or MCP server exit does not delete it.
 - Config file is tmp, deleted in stop_singbox() (not immediately after
   Popen — sing-box may still be reading it).
 - HTTP inbound listens on 127.0.0.1:0 (OS picks a free port); we read
@@ -21,6 +21,8 @@ import json
 import logging
 import os
 import platform
+import re
+import select
 import shutil
 import stat
 import subprocess
@@ -173,30 +175,50 @@ def _build_config(outbound: dict) -> tuple[dict, int]:
     return config, 0
 
 
-def _read_port_from_stderr(proc: subprocess.Popen, timeout: float = 10.0) -> int:
-    """Read the actual listen port from singbox stderr."""
-    import select
+def _read_port_from_stderr(proc: subprocess.Popen, timeout: float = 30.0) -> int:
+    """Read the actual listen port from singbox stderr.
 
+    We read directly from the raw file descriptor with os.read(). Using the
+    buffered reader's read1() can return empty bytes on some platforms even
+    when select() says the fd is readable, causing the port detection to time
+    out even though sing-box has started successfully.
+
+    Timeout is generous (30s) because some deployment machines are slow or
+    remote, and because the first download may have just finished.
+    """
+    fd = proc.stderr.fileno()
     start = time.time()
     buf = b""
     while time.time() - start < timeout:
         if proc.poll() is not None:
+            remaining = b""
+            try:
+                remaining = os.read(fd, 65536)
+            except OSError:
+                pass
             raise RuntimeError(
-                f"sing-box exited early. stderr: {proc.stderr.read().decode(errors='replace') if proc.stderr else ''}"
+                f"sing-box exited early. stderr: {(buf + remaining).decode(errors='replace')}"
             )
-        # select on stderr
-        if proc.stderr is None:
-            time.sleep(0.1)
-            continue
-        r, _, _ = select.select([proc.stderr], [], [], 0.5)
+        # Read directly from the raw fd; the buffered reader's read1() is
+        # unreliable on pipes across platforms.
+        r, _, _ = select.select([fd], [], [], 0.5)
         if r:
-            chunk = proc.stderr.read1(4096) if hasattr(proc.stderr, "read1") else b""
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                chunk = b""
             buf += chunk
             text = buf.decode(errors="replace")
-            # singbox logs like: ... started HTTP inbound listen=127.0.0.1:54321
-            # or: ... listen_address=127.0.0.1 listen_port=54321
-            import re
-            m = re.search(r"listen[_=](?:address=127\.0\.0\.1[_=])?(?:port=|:)(\d+)", text)
+            # Strip ANSI colour codes and log useful lines for debugging.
+            for line in text.splitlines():
+                line_clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+                if line_clean and any(k in line_clean for k in ("FATAL", "ERROR", "listen", "started", "sing-box started")):
+                    logger.info("[singbox] %s", line_clean)
+            # sing-box 1.13+ logs like:
+            # INFO[0000] inbound/http[http-in]: tcp server started at 127.0.0.1:54321
+            m = re.search(r"inbound/http\[[^\]]+\]: tcp server started at .*:(\d+)", text)
+            if not m:
+                m = re.search(r"listen[_=](?:address=127\.0\.0\.1[_=])?(?:port=|:)(\d+)", text)
             if not m:
                 m = re.search(r"127\.0\.0\.1:(\d+)", text)
             if m:
@@ -247,7 +269,10 @@ def start_singbox(outbound_json: str) -> str:
     )
 
     try:
-        port = _read_port_from_stderr(_proc, timeout=10.0)
+        port = _read_port_from_stderr(
+            _proc,
+            timeout=float(os.environ.get("X_MCP_SINGBOX_START_TIMEOUT", "30.0")),
+        )
     except Exception:
         stop_singbox()
         raise
@@ -258,7 +283,12 @@ def start_singbox(outbound_json: str) -> str:
 
 
 def stop_singbox() -> None:
-    """Stop singbox process + delete binary + delete config file."""
+    """Stop singbox process + delete config file.
+
+    We keep the downloaded binary in ~/.x-mcp/singbox-bin/ so that the next
+    set_proxy() call does not have to re-download it. If you need to force a
+    re-download, delete that directory manually.
+    """
     global _proc, _is_managed, _active_proxy, _cfg_path
     if _proc is not None:
         try:
@@ -273,10 +303,9 @@ def stop_singbox() -> None:
         _proc = None
 
     if _is_managed and SINGBOX_BIN.exists():
-        try:
-            SINGBOX_BIN.unlink()
-        except OSError as e:
-            logger.warning(f"[singbox] failed to delete binary: {e}")
+        # Keep the managed binary around as a cache; re-downloading on every
+        # get_cookie() cycle is too slow on machines with poor GitHub connectivity.
+        logger.info(f"[singbox] keeping managed binary at {SINGBOX_BIN}")
     _is_managed = False
 
     if _cfg_path is not None:

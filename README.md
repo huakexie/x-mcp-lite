@@ -106,9 +106,9 @@ Used by `set_proxy(outbound=...)` to turn non-HTTP proxy protocols (trojan/anytl
 1. Resolve binary: try `sing-box` in PATH first; if not found, download via `httpx` from github.com, then 3 mirrors (120s timeout each, all fail → tell user to install manually). We switched from `urllib.request` to `httpx` because `urllib` silently failed in containers (GitHub 302 redirects weren't followed).
 2. Build config: HTTP inbound on `127.0.0.1:0` (OS picks port) + user's outbound + route everything through it.
 3. Write config to a tmp file. The path is stored in a module-level `_cfg_path` and cleaned up in `stop_singbox()` — **not** immediately after `Popen`, because `subprocess.Popen` is async and returns before sing-box has read the file.
-4. Start subprocess; read actual port from stderr (10s timeout).
+4. Start subprocess; read actual port from stderr (30s timeout, configurable via `X_MCP_SINGBOX_START_TIMEOUT`).
 5. Return `http://127.0.0.1:<port>` as the active proxy.
-6. On `stop_singbox()`: terminate → 5s → kill; delete downloaded binary if we managed it (PATH-installed binary is left alone); delete the tmp config file.
+6. On `stop_singbox()`: terminate → 5s → kill; keep the downloaded binary cached in `~/.x-mcp/singbox-bin/` (so the next call does not re-download); delete the tmp config file.
 
 `atexit.register(singbox.stop_singbox)` ensures cleanup even if MCP server crashes.
 
@@ -148,6 +148,7 @@ cd x-mcp-lite
 | `X_MCP_COOKIES_PATH` | No | `~/.x-mcp/cookies.json` | Path to cookies file |
 | `X_MCP_PROXY` | No | — | HTTP/HTTPS/SOCKS5 proxy URL fallback for `get_cookie()` auto-login. Agents can also pass `proxy=` at call time, or use `set_proxy(outbound=...)` for non-HTTP/SOCKS5 protocols. |
 | `USER_AGENT` | No | twikit default | Custom User-Agent |
+| `X_MCP_SINGBOX_START_TIMEOUT` | No | `30` | Seconds to wait for sing-box to log its local HTTP listen port. Increase on slow/remote deployment machines. |
 | `CAPSOLVER_API_KEY` | No | — | Capsolver API key (only needed if you hit Arkose challenges) |
 
 ¹ Only required if you ever use `get_cookie()` Strategy 3 (auto-login). If you only ever paste cookies via `get_cookie(cookie_json=...)`, credentials aren't needed.
@@ -193,7 +194,7 @@ Best when you don't have cookies yet and want to log into Twitter fresh.
    - **Other protocols** (trojan/anytls/ss/vmess/etc): call `set_proxy(outbound="<sing-box outbound JSON>")` first, then `get_cookie()` with no args.
    - **No proxy** (server already on a residential IP): call `get_cookie()` with no args.
 
-twikit logs in via the chosen proxy (or direct), saves cookies to `X_MCP_COOKIES_PATH`. On success, sing-box (if started) is auto-stopped and its binary deleted — one-shot pattern.
+twikit logs in via the chosen proxy (or direct), saves cookies to `X_MCP_COOKIES_PATH`. On success, sing-box (if started) is auto-stopped — one-shot pattern. The downloaded binary is kept cached in `~/.x-mcp/singbox-bin/` so the next call does not re-download.
 
 #### `set_proxy` for non-HTTP/SOCKS5 protocols
 
@@ -207,7 +208,7 @@ await set_proxy(outbound='{"type":"trojan","server":"tw.example.com","server_por
 await get_cookie()
 ```
 
-sing-box binary is downloaded to `~/.x-mcp/singbox-bin/` on first use (tries github.com first, then 3 mirrors, then a user-installed `sing-box` in PATH). After `get_cookie` succeeds, sing-box is stopped and the downloaded binary deleted. Pass `None` to `set_proxy` to stop manually.
+sing-box binary is downloaded to `~/.x-mcp/singbox-bin/` on first use (tries github.com first, then 3 mirrors, then a user-installed `sing-box` in PATH). After `get_cookie` succeeds, sing-box is stopped; the binary is left cached for reuse. Pass `None` to `set_proxy` to stop manually.
 
 #### `get_cookie` with no args and no proxy configured
 
@@ -246,7 +247,7 @@ This is the recommended path if your MCP server runs on a datacenter IP (VPS, co
 1. **On your local machine** (residential IP, or behind a VPN):
    - Configure `x-mcp-lite` with `TWITTER_USERNAME` / `TWITTER_PASSWORD`.
    - In your MCP client, call `set_proxy(outbound="<sing-box outbound JSON for your trojan node>")`.
-   - Call `get_cookie()` with no args. sing-box starts, twikit logs in via it, cookies are saved to `~/.x-mcp/cookies.json`, sing-box stops and binary is deleted.
+   - Call `get_cookie()` with no args. sing-box starts, twikit logs in via it, cookies are saved to `~/.x-mcp/cookies.json`, sing-box stops and the binary is cached for reuse.
 
 2. **Deploy to the server**:
    - Copy `~/.x-mcp/cookies.json` from your local machine to the server (e.g. `/opt/mcphub/data/x-mcp-lite/cookies.json`).
