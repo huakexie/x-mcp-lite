@@ -6,11 +6,14 @@ into a local HTTP proxy that twikit/httpx can consume directly.
 Design:
 - Binary downloaded to ~/.x-mcp/singbox-bin/sing-box on first use, deleted
   when set_proxy(None) is called or MCP server exits.
-- Config file is tmp, deleted immediately after singbox starts (singbox
-  reads it into memory at startup).
+- Config file is tmp, deleted in stop_singbox() (not immediately after
+  Popen — sing-box may still be reading it).
 - HTTP inbound listens on 127.0.0.1:0 (OS picks a free port); we read
   the actual port from singbox's stderr.
 - Process is killed on cleanup: terminate() -> 5s -> kill().
+
+Download: uses httpx (already a transitive dep via twikit) instead of
+urllib.request — handles GitHub's 302 redirects and TLS more reliably.
 """
 from __future__ import annotations
 
@@ -26,7 +29,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Optional
-from urllib.request import urlopen
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +97,10 @@ def _download_binary() -> Path:
     for url in urls:
         try:
             logger.info(f"[singbox] downloading from {url}")
-            with urlopen(url, timeout=120) as resp:
-                data = resp.read()
+            with httpx.Client(follow_redirects=True, timeout=120.0) as http:
+                resp = http.get(url)
+                resp.raise_for_status()
+                data = resp.content
             tmp_tar = SINGBOX_DIR / "sing-box.tar.gz"
             tmp_tar.write_bytes(data)
             with tarfile.open(tmp_tar, "r:gz") as tar:
