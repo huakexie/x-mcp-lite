@@ -9,7 +9,7 @@ Keeps the read-only tools + bookmark/like management, **cuts** the high-risk wri
 - An **anti-rate-limit layer** the original project lacks entirely
 - A **twikit 2.3.3 patch** for the upstream `KEY_BYTE indices` breakage (x.com changed homepage HTML format on 2026-03-18, twikit hasn't shipped a fix)
 - A **cookie-based auth flow** (`get_cookie` + `set_proxy`) so the server can run on datacenter IPs without triggering Cloudflare blocks
-- A **sing-box integration** (`set_proxy`) for users with only non-HTTP proxy protocols (trojan/anytls/ss)
+- A **sing-box integration** (`set_proxy`) for users with only non-HTTP/SOCKS5 proxy protocols (trojan/anytls/ss/vmess/etc)
 
 ---
 
@@ -141,7 +141,7 @@ cd x-mcp-lite
 | `TWITTER_PASSWORD` | Yes¹ | — | X password (used by auto-login) |
 | `TWITTER_EMAIL` | No | — | Email if your account has one; omitted if not set (twikit accepts `auth_info_2=None`) |
 | `X_MCP_COOKIES_PATH` | No | `~/.x-mcp/cookies.json` | Path to cookies file |
-| `X_MCP_PROXY` | No | — | HTTP/SOCKS5 proxy URL fallback for `get_cookie()` auto-login. Agents can also pass `proxy=` at call time, or use `set_proxy(outbound=...)` for non-HTTP protocols. |
+| `X_MCP_PROXY` | No | — | HTTP/HTTPS/SOCKS5 proxy URL fallback for `get_cookie()` auto-login. Agents can also pass `proxy=` at call time, or use `set_proxy(outbound=...)` for non-HTTP/SOCKS5 protocols. |
 | `USER_AGENT` | No | twikit default | Custom User-Agent |
 | `CAPSOLVER_API_KEY` | No | — | Capsolver API key (only needed if you hit Arkose challenges) |
 
@@ -156,6 +156,8 @@ The MCP server starts automatically when your MCP host launches. `uvx` will pull
 ## Cookie setup
 
 Twitter's Cloudflare blocks login requests from datacenter IPs with HTTP 403. **Credentials (`TWITTER_USERNAME` / `TWITTER_PASSWORD`) must be set in the MCP server env at startup** — agents can't pass them at runtime (security: don't let LLMs handle plaintext passwords). The proxy, however, can be passed at runtime.
+
+Any proxy that can reach x.com works for login. Residential IPs are **recommended** (less likely to be blocked by Cloudflare), but datacenter proxies, VPN nodes, trojan/anytls/ss nodes etc all work — if Cloudflare blocks one, try another.
 
 Use the `get_cookie` MCP tool. It picks a strategy based on what you pass:
 
@@ -176,20 +178,21 @@ Best when cookies are already saved somewhere on this machine.
 
 Reads, validates, and atomically writes to `X_MCP_COOKIES_PATH`. Refuses if source equals target.
 
-### Strategy 3: Auto-login (needs credentials + proxy on datacenter IPs)
+### Strategy 3: Auto-login (needs credentials + optional proxy)
 
 Best when you don't have cookies yet and want to log into Twitter fresh.
 
 1. Ensure `TWITTER_USERNAME` / `TWITTER_PASSWORD` are set in MCP server env.
 2. Pick a proxy method:
-   - **HTTP/SOCKS5 proxy URL** (e.g. linktube residential): call `get_cookie(proxy="http://user:pass@host:port")`.
-   - **Non-HTTP protocol** (trojan/anytls/ss): call `set_proxy(outbound="<sing-box outbound JSON>")` first, then `get_cookie()` with no args.
+   - **HTTP/HTTPS/SOCKS5 proxy URL** (any proxy that can reach x.com): call `get_cookie(proxy="http://user:pass@host:port")` or `socks5://host:port`.
+   - **Other protocols** (trojan/anytls/ss/vmess/etc): call `set_proxy(outbound="<sing-box outbound JSON>")` first, then `get_cookie()` with no args.
+   - **No proxy** (server already on a residential IP): call `get_cookie()` with no args.
 
-twikit logs in via the chosen proxy (or direct on residential IPs), saves cookies to `X_MCP_COOKIES_PATH`. On success, sing-box (if started) is auto-stopped and its binary deleted — one-shot pattern.
+twikit logs in via the chosen proxy (or direct), saves cookies to `X_MCP_COOKIES_PATH`. On success, sing-box (if started) is auto-stopped and its binary deleted — one-shot pattern.
 
-#### `set_proxy` for non-HTTP protocols
+#### `set_proxy` for non-HTTP/SOCKS5 protocols
 
-If you only have trojan/anytls/ss nodes (no HTTP proxy URL), use `set_proxy`:
+If you only have trojan/anytls/ss/vmess nodes (no HTTP/SOCKS5 proxy URL), use `set_proxy`:
 
 ```python
 # Agent passes a sing-box outbound JSON
@@ -209,8 +212,8 @@ If you call `get_cookie()` with no args and there's no `set_proxy`-started sing-
 
 When an agent calls any tool (e.g. `get_bookmarks`) and cookies are missing/expired, the error message tells the agent to call `get_cookie` (one-line hint). The agent then either:
 
-- Asks the user for an HTTP/SOCKS5 proxy URL and calls `get_cookie(proxy="<url>")`
-- Asks the user for a non-HTTP node config, converts to sing-box outbound JSON, calls `set_proxy(outbound="<JSON>")` then `get_cookie()`
+- Asks the user for an HTTP/HTTPS/SOCKS5 proxy URL and calls `get_cookie(proxy="<url>")`
+- Asks the user for a trojan/anytls/ss/vmess node config, converts to sing-box outbound JSON, calls `set_proxy(outbound="<JSON>")` then `get_cookie()`
 - Asks the user to paste cookies from elsewhere (browser export or another machine) and calls `get_cookie(cookie_json="<JSON>")`
 
 If `TWITTER_USERNAME` / `TWITTER_PASSWORD` are missing, the error tells the user to restart the MCP server with these env vars configured.
@@ -227,7 +230,7 @@ If cookies later expire (Twitter requires re-verification), API calls fail with 
 
 ### Default behavior (no `get_cookie` call)
 
-If you skip the `get_cookie` flow entirely, the server will attempt auto-login on first run with `TWITTER_USERNAME` / `TWITTER_PASSWORD` and save cookies to `~/.x-mcp/cookies.json`. This works on residential IPs but will fail with 403 on datacenter IPs — use the `get_cookie` flow above for server deployments.
+If you skip the `get_cookie` flow entirely, the server will attempt auto-login on first run with `TWITTER_USERNAME` / `TWITTER_PASSWORD` and save cookies to `~/.x-mcp/cookies.json`. This works if the server's IP can reach x.com (residential or any proxy); fails with 403 on blocked datacenter IPs — use the `get_cookie` flow above for server deployments.
 
 ---
 
@@ -264,7 +267,7 @@ import twikit
 
 ### `Forbidden (403)` on login
 
-The server is on a datacenter IP and Cloudflare blocked the login. Use `set_proxy(outbound="<sing-box JSON>")` + `get_cookie()` to route login through a residential proxy.
+The server is on a datacenter IP and Cloudflare blocked the login. Use `get_cookie(proxy="<proxy URL>")` (HTTP/HTTPS/SOCKS5) or `set_proxy(outbound="<sing-box JSON>")` + `get_cookie()` (trojan/anytls/ss/etc) to route login through any proxy that can reach x.com. Residential proxies are most reliable but any proxy works.
 
 ### `Unauthorized (401)` on API calls
 

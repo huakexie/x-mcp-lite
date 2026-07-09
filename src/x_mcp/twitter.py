@@ -149,14 +149,15 @@ async def get_cookie(
 ) -> str:
     """Set up Twitter cookies for this MCP server. Pick one strategy by passing the corresponding argument.
 
-    STRATEGY 1 (recommended): proxy="<residential proxy URL>"
-      Performs an automated twikit login routed through a residential proxy.
-      Does NOT involve handling user credentials — TWITTER_USERNAME and
-      TWITTER_PASSWORD stay inside the MCP server env; you only pass a
-      network proxy address (e.g. http://user:pass@host:port or socks5://host:port).
-      Use this when the server is on a datacenter IP and login is blocked
-      by Cloudflare. Falls back to X_MCP_PROXY env var if `proxy` is None,
-      then to direct connection.
+    STRATEGY 1 (recommended): proxy="<proxy URL>"
+      Performs an automated twikit login routed through a proxy. Does NOT
+      involve handling user credentials — TWITTER_USERNAME and TWITTER_PASSWORD
+      stay inside the MCP server env; you only pass a network proxy address.
+      Format: http://user:pass@host:port, https://..., socks5://host:port,
+      or socks5h://host:port. Falls back to X_MCP_PROXY env var if `proxy`
+      is None, then to direct connection.
+      Tip: residential proxies are less likely to be blocked by Cloudflare
+      than datacenter IPs, but any proxy that can reach x.com works.
 
     STRATEGY 2 (only if user can't provide a proxy): cookie_json="<JSON string>"
       Writes the given JSON directly to the cookies path. Use this when the
@@ -169,7 +170,11 @@ async def get_cookie(
       Copies a local file to the cookies path. Same caveat as STRATEGY 2.
 
     If neither argument is passed: returns a short prompt asking for a
-    proxy URL (so the agent knows what to do next).
+    proxy URL or sing-box outbound (so the agent knows what to do next).
+
+    For non-HTTP proxy protocols (trojan/anytls/ss/etc), call set_proxy()
+    first to start a local sing-box HTTP proxy, then call get_cookie() with
+    no args — it picks up the local proxy automatically.
     """
     import tempfile
 
@@ -260,13 +265,14 @@ async def get_cookie(
         effective_proxy = PROXY_URL
     else:
         return (
-            "Provide a residential proxy URL to route the login through. "
-            "Format: http://user:pass@host:port or socks5://host:port.\n"
+            "Provide a proxy URL to route the login through. "
+            "Format: http://user:pass@host:port, https://..., socks5://host:port, socks5h://host:port.\n"
             "Pass it as the `proxy` argument: get_cookie(proxy=\"<the URL>\").\n"
-            "Or use set_proxy(outbound=\"<sing-box outbound JSON>\") to start a "
-            "local HTTP proxy from a non-HTTP protocol (trojan/anytls/ss/etc).\n"
+            "For non-HTTP protocols (trojan/anytls/ss/etc), call set_proxy(outbound=\"<sing-box outbound JSON>\") "
+            "first to start a local HTTP proxy, then call get_cookie() with no args.\n"
             "This is a network proxy address, not an X account credential — "
-            "TWITTER_USERNAME and TWITTER_PASSWORD stay inside the MCP server env."
+            "TWITTER_USERNAME and TWITTER_PASSWORD stay inside the MCP server env.\n"
+            "Tip: residential proxies are less likely to be blocked by Cloudflare than datacenter IPs."
         )
     try:
         client = await get_twitter_client(proxy=effective_proxy)
@@ -287,25 +293,31 @@ async def get_cookie(
 async def set_proxy(
     outbound: Optional[str] = None,
 ) -> str:
-    """Configure the proxy used by get_cookie() for the next auto-login.
+    """Configure a local HTTP proxy from a non-HTTP/SOCKS5 proxy protocol, for use by get_cookie().
 
-    Pass an `outbound` JSON string (a sing-box outbound config, e.g. trojan/
-    anytls/ss). This will:
-      1. Download the sing-box binary to ~/.x-mcp/singbox-bin/ if not already
-         installed (tries github.com first, then mirrors; falls back to a
-         user-installed `sing-box` in PATH).
-      2. Start sing-box as a local HTTP inbound (127.0.0.1:<random port>),
-         routing through the given outbound.
-      3. Set the local HTTP URL as the active proxy for get_cookie().
+    Use this when the user only has a trojan/anytls/ss/vmess/etc node config
+    (no direct HTTP/SOCKS5 proxy URL). The user's node config is converted
+    to a sing-box outbound and run as a local HTTP inbound.
+
+    Pass an `outbound` JSON string (a sing-box outbound config). This will:
+      1. Resolve the sing-box binary: try `sing-box` in PATH first; if not
+         found, download to ~/.x-mcp/singbox-bin/ (tries github.com first,
+         then 3 mirrors, 120s timeout each; both fail -> ask user to install
+         manually).
+      2. Build a full sing-box config: HTTP inbound on 127.0.0.1:<random port>
+         + user's outbound + route everything through it.
+      3. Start sing-box subprocess; read actual port from stderr (10s timeout).
+      4. Set http://127.0.0.1:<port> as the active proxy for get_cookie().
 
     Pass None (or call with no args) to stop sing-box, delete the downloaded
-    binary, and clear the active proxy.
+    binary (if we managed it), and clear the active proxy.
 
     Typical agent flow:
-      1. Call set_proxy(outbound="<sing-box outbound JSON>")
-      2. Call get_cookie() — uses the local proxy automatically, logs into
-         Twitter, saves cookies, and auto-stops sing-box.
-      3. Retry the original call (e.g. get_bookmarks).
+      1. Convert the user's node config to a sing-box outbound JSON.
+      2. Call set_proxy(outbound="<sing-box outbound JSON>").
+      3. Call get_cookie() with no args — it uses the local proxy automatically,
+         logs into Twitter, saves cookies, and auto-stops sing-box on success.
+      4. Retry the original call (e.g. get_bookmarks).
     """
     if outbound is None:
         singbox.stop_singbox()
